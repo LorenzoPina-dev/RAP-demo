@@ -13,9 +13,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from rap_demo.core.mcts import extract_best_trajectory
 from rap_demo.domains.blocksworld.models import BlockState
 from rap_demo.domains.blocksworld.problem import parse_goal, parse_initial_state
 from rap_demo.llm.base import LLMError
+from rap_demo.storage.runs import deserialize_tree, list_runs, load_run
 from rap_demo.visualizer.serializer import serialize_blocksworld_state, serialize_tree
 from rap_demo.visualizer.web.controller import SearchController
 
@@ -41,6 +43,16 @@ class ProblemRequest(BaseModel):
     )
 
 
+class ReplayRequest(BaseModel):
+    """Request payload for loading a saved run in replay mode."""
+
+    ref: str = Field(
+        "latest",
+        min_length=1,
+        description="Run reference: 'latest', 1-based index, run_id/prefix, or file path",
+    )
+
+
 class _NoCacheStaticFiles(StaticFiles):
     """StaticFiles handler that prevents stale browser-cached CSS/JS assets."""
 
@@ -50,7 +62,45 @@ class _NoCacheStaticFiles(StaticFiles):
         return response
 
 
-def create_app(controller: Optional[SearchController] = None) -> FastAPI:
+def _status_value(controller: SearchController) -> str:
+    """Returns the controller status as a plain string."""
+    return controller.status.value if hasattr(controller.status, "value") else str(controller.status)
+
+
+def _serialize_current_state(controller: SearchController) -> Any:
+    """Serializes the controller's current domain state for the tabletop."""
+    state = controller.current_state
+    if isinstance(state, BlockState):
+        return serialize_blocksworld_state(state)
+    if isinstance(state, dict):
+        return state
+    return {"state": str(state)}
+
+
+def _replay_payload(
+    controller: SearchController,
+    run: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Builds the REST payload returned after loading or leaving a replay."""
+    return {
+        "iteration": controller.iteration,
+        "max_iterations": controller.max_iterations,
+        "status": _status_value(controller),
+        "goal": controller.goal,
+        "mode": controller.mode,
+        "tree": serialize_tree(controller.root),
+        "state": _serialize_current_state(controller),
+        "best_path_ids": controller.get_best_path_ids(),
+        "replay": controller.is_replay,
+        "can_exit_replay": controller.can_exit_replay,
+        "run": run if run is not None else controller.replay_meta,
+    }
+
+
+def create_app(
+    controller: Optional[SearchController] = None,
+    runs_dir: Any = None,
+) -> FastAPI:
     """Factory creating FastAPI application wired with SearchController."""
     ctrl: SearchController = controller or SearchController()
     server = FastAPI(title="RAP Visualizer Dashboard")
@@ -82,12 +132,7 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
     @server.get("/api/state")
     async def get_state() -> Any:
         """Returns current domain state representation."""
-        state = ctrl.current_state
-        if isinstance(state, BlockState):
-            return serialize_blocksworld_state(state)
-        if isinstance(state, dict):
-            return state
-        return {"state": str(state)}
+        return _serialize_current_state(ctrl)
 
     @server.get("/api/meta")
     async def get_meta() -> dict[str, Any]:
@@ -102,10 +147,57 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
             "mode": ctrl.mode,
             "goal": ctrl.goal,
             "initial_state": initial_state_text,
-            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "status": _status_value(ctrl),
             "iteration": ctrl.iteration,
             "best_path_ids": ctrl.get_best_path_ids(),
+            "replay": ctrl.is_replay,
+            "can_exit_replay": ctrl.can_exit_replay,
+            "run": ctrl.replay_meta,
         }
+
+    @server.get("/api/runs")
+    async def get_runs(limit: int = 50) -> dict[str, Any]:
+        """Lists saved runs available for replay, newest first."""
+        bounded = max(0, min(int(limit), 500))
+        return {"runs": list_runs(runs_dir=runs_dir, limit=bounded)}
+
+    @server.post("/api/replay")
+    async def post_replay(request: ReplayRequest) -> dict[str, Any]:
+        """Loads a saved run and switches the controller to replay mode (no LLM calls)."""
+        try:
+            run_data = load_run(request.ref, runs_dir=runs_dir)
+            root = deserialize_tree(run_data["tree"])
+            replay_path = extract_best_trajectory(root)
+            if not replay_path:
+                replay_path = [root]
+        except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        run_meta = {
+            "run_id": run_data.get("run_id"),
+            "created_at": run_data.get("created_at"),
+            "domain": run_data.get("domain"),
+            "mode": run_data.get("mode"),
+            "backend": run_data.get("backend"),
+            "model": run_data.get("model"),
+            "iterations": run_data.get("iterations", 0),
+            "metrics": run_data.get("metrics", {}),
+            "goal": run_data.get("goal"),
+        }
+        await ctrl.enter_replay(
+            root=root,
+            replay_path=replay_path,
+            goal=run_data.get("goal"),
+            mode=run_data.get("mode"),
+            run_meta=run_meta,
+        )
+        return _replay_payload(ctrl, run_meta)
+
+    @server.post("/api/replay/exit")
+    async def post_replay_exit() -> dict[str, Any]:
+        """Leaves replay mode and restores the live search state, when available."""
+        await ctrl.exit_replay()
+        return _replay_payload(ctrl)
 
     @server.post("/api/problem")
     async def post_problem(problem: ProblemRequest) -> dict[str, Any]:
@@ -120,7 +212,7 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
         return {
             "iteration": ctrl.iteration,
             "max_iterations": ctrl.max_iterations,
-            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "status": _status_value(ctrl),
             "goal": ctrl.goal,
             "state": serialize_blocksworld_state(initial_state),
             "tree": serialize_tree(ctrl.root),
@@ -144,9 +236,11 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
         return {
             "iteration": ctrl.iteration,
             "max_iterations": ctrl.max_iterations,
-            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "status": _status_value(ctrl),
             "tree": serialize_tree(ctrl.root),
+            "state": _serialize_current_state(ctrl),
             "best_path_ids": ctrl.get_best_path_ids(),
+            "replay": ctrl.is_replay,
         }
 
     @server.post("/api/search/start")
@@ -155,7 +249,8 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
         res = await ctrl.start()
         return {
             "iteration": ctrl.iteration,
-            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "status": _status_value(ctrl),
+            "replay": ctrl.is_replay,
         }
 
     @server.post("/api/search/pause")

@@ -23,6 +23,10 @@ class VisualizerApp {
     this.stepTicker = null;
     this.syncTimer = null;
     this.eventSource = null;
+    this.replayMode = false;
+    this.canExitReplay = false;
+    this.replayRuns = [];
+    this.replayMeta = null;
     this.liveStream = {
       active: false,
       iteration: 0,
@@ -98,6 +102,17 @@ class VisualizerApp {
     this.btnProblemClose = document.getElementById("btn-problem-close");
     this.btnProblemApply = document.getElementById("btn-problem-apply");
 
+    this.btnReplay = document.getElementById("btn-replay");
+    this.replayBadge = document.getElementById("replay-badge");
+    this.replayDialog = document.getElementById("replay-dialog");
+    this.replaySelect = document.getElementById("replay-run-select");
+    this.replayDetails = document.getElementById("replay-details");
+    this.replayError = document.getElementById("replay-error");
+    this.btnReplayClose = document.getElementById("btn-replay-close");
+    this.btnReplayCancel = document.getElementById("btn-replay-cancel");
+    this.btnReplayLoad = document.getElementById("btn-replay-load");
+    this.btnReplayLive = document.getElementById("btn-replay-live");
+
     this.trajectoryStrip = document.getElementById("trajectory-strip");
     this.btnFollowBest = document.getElementById("btn-follow-best");
     this.tabOverview = document.getElementById("tab-overview");
@@ -166,6 +181,25 @@ class VisualizerApp {
         e.preventDefault();
         this.applyProblem();
       });
+    }
+
+    if (this.btnReplay) {
+      this.btnReplay.addEventListener("click", () => this.openReplayDialog());
+    }
+    if (this.btnReplayClose) {
+      this.btnReplayClose.addEventListener("click", () => this.closeReplayDialog());
+    }
+    if (this.btnReplayCancel) {
+      this.btnReplayCancel.addEventListener("click", () => this.closeReplayDialog());
+    }
+    if (this.replaySelect) {
+      this.replaySelect.addEventListener("change", () => this.renderReplayDetails());
+    }
+    if (this.btnReplayLoad) {
+      this.btnReplayLoad.addEventListener("click", () => this.loadReplay());
+    }
+    if (this.btnReplayLive) {
+      this.btnReplayLive.addEventListener("click", () => this.exitReplay());
     }
 
     if (this.speedSlider) {
@@ -443,6 +477,197 @@ class VisualizerApp {
     }
   }
 
+  /* ========================================================================
+     Replay Mode (cached runs, no LLM calls)
+     ======================================================================== */
+
+  openReplayDialog() {
+    this.hideReplayError();
+    if (this.replayDialog && !this.replayDialog.open) this.replayDialog.showModal();
+    if (this.replaySelect) {
+      this.replaySelect.innerHTML = "";
+      const loading = document.createElement("option");
+      loading.textContent = "Loading saved runs...";
+      loading.disabled = true;
+      this.replaySelect.appendChild(loading);
+    }
+    if (this.replayDetails) this.replayDetails.textContent = "";
+    if (this.btnReplayLoad) this.btnReplayLoad.disabled = true;
+    if (this.btnReplayLive) this.btnReplayLive.hidden = !(this.replayMode && this.canExitReplay);
+    this.fetchReplayRuns();
+  }
+
+  async fetchReplayRuns() {
+    try {
+      const res = await fetch("/api/runs?limit=100");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.replayRuns = Array.isArray(data.runs) ? data.runs : [];
+      this.populateReplayRuns();
+    } catch (err) {
+      this.showReplayError(`Could not load saved runs: ${err.message}`);
+    }
+  }
+
+  populateReplayRuns() {
+    if (!this.replaySelect) return;
+    this.replaySelect.innerHTML = "";
+    if (this.replayRuns.length === 0) {
+      const empty = document.createElement("option");
+      empty.textContent = "No saved runs found in the runs directory";
+      empty.disabled = true;
+      this.replaySelect.appendChild(empty);
+      if (this.btnReplayLoad) this.btnReplayLoad.disabled = true;
+      if (this.replayDetails) this.replayDetails.textContent = "";
+      return;
+    }
+    for (const run of this.replayRuns) {
+      const option = document.createElement("option");
+      option.value = String(run.run_id || "");
+      const metrics = run.metrics || {};
+      const reward = metrics["Best Reward"] !== undefined ? metrics["Best Reward"] : "—";
+      option.textContent = `${run.run_id}  ·  ${run.mode || "?"}  ·  ${run.iterations ?? 0} it  ·  reward ${reward}`;
+      this.replaySelect.appendChild(option);
+    }
+    if (this.btnReplayLoad) this.btnReplayLoad.disabled = false;
+    this.renderReplayDetails();
+  }
+
+  renderReplayDetails() {
+    if (!this.replayDetails || !this.replaySelect) return;
+    const run = this.replayRuns.find((item) => String(item.run_id) === this.replaySelect.value);
+    if (!run) {
+      this.replayDetails.textContent = "";
+      return;
+    }
+    const goal = Array.isArray(run.goal) ? run.goal.join(" · ") : (run.goal || "—");
+    const model = run.model ? ` · ${run.model}` : "";
+    const metrics = run.metrics || {};
+    const reward = metrics["Best Reward"] !== undefined ? metrics["Best Reward"] : "—";
+    this.replayDetails.textContent = [
+      `Backend: ${run.backend || "?"}${model}`,
+      `Created: ${run.created_at || "?"}`,
+      `Best reward: ${reward}`,
+      `Goal: ${goal}`,
+    ].join("\n");
+  }
+
+  async loadReplay() {
+    if (!this.replaySelect || !this.replaySelect.value) return;
+    this.hideReplayError();
+    const label = this.btnReplayLoad ? this.btnReplayLoad.textContent : "";
+    if (this.btnReplayLoad) {
+      this.btnReplayLoad.disabled = true;
+      this.btnReplayLoad.textContent = "Loading...";
+    }
+    try {
+      const res = await fetch("/api/replay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ref: this.replaySelect.value }),
+      });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson && errJson.detail) {
+            detail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
+          }
+        } catch (_) {}
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      this.applyReplayPayload(data);
+      this.closeReplayDialog();
+      const runId = data.run && data.run.run_id ? data.run.run_id : "run";
+      this.showToast(`Replay loaded: ${runId}. Use Step or Play.`);
+    } catch (err) {
+      console.error("Failed to load replay:", err);
+      this.showReplayError(`Replay failed: ${err.message}`);
+    } finally {
+      if (this.btnReplayLoad) {
+        this.btnReplayLoad.disabled = false;
+        this.btnReplayLoad.textContent = label || "Load replay";
+      }
+    }
+  }
+
+  async exitReplay() {
+    this.hideReplayError();
+    const label = this.btnReplayLive ? this.btnReplayLive.textContent : "";
+    if (this.btnReplayLive) {
+      this.btnReplayLive.disabled = true;
+      this.btnReplayLive.textContent = "Restoring...";
+    }
+    try {
+      const res = await fetch("/api/replay/exit", { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.applyReplayPayload(data);
+      this.closeReplayDialog();
+      this.showToast("Live search restored.");
+    } catch (err) {
+      console.error("Failed to leave replay:", err);
+      this.showReplayError(`Could not restore live search: ${err.message}`);
+    } finally {
+      if (this.btnReplayLive) {
+        this.btnReplayLive.disabled = false;
+        this.btnReplayLive.textContent = label || "Back to live";
+      }
+    }
+  }
+
+  applyReplayPayload(data) {
+    this.replayMeta = data.run || null;
+    this.canExitReplay = Boolean(data.can_exit_replay);
+    if (data.max_iterations !== undefined) this.maxIterations = data.max_iterations;
+    if (data.goal !== undefined) this.goal = data.goal;
+    if (data.mode && this.modeBadge) {
+      this.modeBadge.textContent = data.mode;
+      this.modeBadge.hidden = false;
+    }
+    this.bestPathIds = new Set(Array.isArray(data.best_path_ids) ? data.best_path_ids : []);
+    this.treeData = data.tree || null;
+    this.stateData = data.state || null;
+    this.selectedNode = null;
+    this.hasManualViewport = false;
+    this.liveStream.active = false;
+    this.liveElements = null;
+    this.renderGoal(this.goal);
+    this.setReplayUi(Boolean(data.replay));
+    this.updateStatus(data.status, data.iteration);
+    if (this.treeData) this.syncTreeAndSelection(true);
+    this.renderTabletop();
+    this.scheduleTreeFit();
+  }
+
+  setReplayUi(enabled) {
+    this.replayMode = Boolean(enabled);
+    if (this.replayBadge) this.replayBadge.hidden = !this.replayMode;
+    if (this.btnEditProblem) this.btnEditProblem.disabled = this.replayMode;
+    if (this.btnReplay) this.btnReplay.classList.toggle("active", this.replayMode);
+    if (this.btnReplayLive) {
+      this.btnReplayLive.hidden = !(this.replayMode && this.canExitReplay);
+    }
+  }
+
+  showReplayError(message) {
+    if (!this.replayError) return;
+    this.replayError.textContent = message;
+    this.replayError.hidden = false;
+  }
+
+  hideReplayError() {
+    if (!this.replayError) return;
+    this.replayError.textContent = "";
+    this.replayError.hidden = true;
+  }
+
+  closeReplayDialog() {
+    if (this.replayDialog && this.replayDialog.open) this.replayDialog.close();
+    this.hideReplayError();
+  }
+
   async postAction(endpoint) {
     const isStep = endpoint.endsWith("/step");
     if (isStep) {
@@ -467,6 +692,9 @@ class VisualizerApp {
       }
       if (Array.isArray(data.best_path_ids)) {
         this.bestPathIds = new Set(data.best_path_ids);
+      }
+      if (data.replay !== undefined) {
+        this.setReplayUi(Boolean(data.replay));
       }
       this.updateStatus(data.status, data.iteration);
 
@@ -612,6 +840,9 @@ class VisualizerApp {
     if (typeof meta.initial_state === "string") {
       this.initialStateText = meta.initial_state;
     }
+    this.replayMeta = meta.run || null;
+    this.canExitReplay = Boolean(meta.can_exit_replay);
+    this.setReplayUi(Boolean(meta.replay));
     this.renderGoal(meta.goal);
     this.updateStatus(meta.status, meta.iteration);
   }
@@ -676,6 +907,9 @@ class VisualizerApp {
   handleEvent(payload) {
     if (payload.max_iterations !== undefined) {
       this.maxIterations = payload.max_iterations;
+    }
+    if (payload.replay !== undefined) {
+      this.setReplayUi(Boolean(payload.replay));
     }
     if (Array.isArray(payload.best_path_ids)) {
       this.bestPathIds = new Set(payload.best_path_ids);

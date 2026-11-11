@@ -730,7 +730,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
         )
 
         create_app_fn = sys.modules["rap_demo.visualizer.web.app"].create_app
-        app = create_app_fn(controller)
+        runs_dir = getattr(args, "runs_dir", None)
+        app = create_app_fn(controller, runs_dir=runs_dir) if runs_dir else create_app_fn(controller)
         import uvicorn
 
         uvicorn.run(app, host=args.host, port=args.port)
@@ -946,7 +947,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 initial_status=SearchStatus.FINISHED,
             )
             create_app_fn = sys.modules["rap_demo.visualizer.web.app"].create_app
-            app = create_app_fn(controller)
+            runs_dir = getattr(args, "runs_dir", None)
+            app = create_app_fn(controller, runs_dir=runs_dir) if runs_dir else create_app_fn(controller)
             import uvicorn
 
             uvicorn.run(app, host=args.host, port=args.port)

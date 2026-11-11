@@ -184,6 +184,18 @@ body {
   border: 1px solid var(--accent-border);
 }
 
+.replay-badge {
+  background: var(--accent-soft);
+  color: var(--status-paused);
+  border-color: var(--status-paused);
+}
+
+.btn.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -1459,6 +1471,24 @@ svg.tree-svg {
   outline: none;
   border-color: var(--accent-border);
   box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.replay-select {
+  padding: 4px;
+  overflow-y: auto;
+  white-space: normal;
+}
+
+.replay-select option {
+  padding: 6px 8px;
+  border-radius: 4px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.replay-details {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .dialog-error {

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RAP Visualizer — Reasoning via Planning</title>
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
   <header class="topbar">
@@ -13,6 +13,7 @@
       <div class="brand-titles">
         <h1>Reasoning via Planning</h1>
         <span id="mode-badge" class="mode-badge" hidden>hybrid</span>
+        <span id="replay-badge" class="mode-badge replay-badge" hidden>replay</span>
       </div>
     </div>
 
@@ -50,6 +51,11 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path></svg>
           <span>Reset</span>
           <kbd>R</kbd>
+        </button>
+
+        <button id="btn-replay" class="btn" title="Replay a saved run without calling the LLM">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><polygon points="10 9 16 12 10 15 10 9"></polygon></svg>
+          <span>Replay</span>
         </button>
       </div>
 
@@ -228,6 +234,33 @@
     </section>
   </main>
 
+  <dialog id="replay-dialog" class="problem-dialog" aria-labelledby="replay-dialog-title">
+    <div class="problem-form">
+      <div class="dialog-header">
+        <h2 id="replay-dialog-title">Replay a saved run</h2>
+        <button id="btn-replay-close" class="btn btn-icon" type="button" aria-label="Close replay picker" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg>
+        </button>
+      </div>
+
+      <p class="dialog-hint">Loads a cached run and walks its best trajectory with Step / Play. No LLM calls are made.</p>
+
+      <label class="field" for="replay-run-select">
+        <span class="field-label">Saved runs · newest first</span>
+        <select id="replay-run-select" class="problem-input replay-select" size="8"></select>
+      </label>
+
+      <p id="replay-details" class="dialog-hint replay-details"></p>
+      <p id="replay-error" class="dialog-error" role="alert" hidden></p>
+
+      <div class="dialog-actions">
+        <button id="btn-replay-live" class="btn" type="button" hidden>Back to live</button>
+        <button id="btn-replay-cancel" class="btn" type="button">Cancel</button>
+        <button id="btn-replay-load" class="btn btn-primary" type="button">Load replay</button>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="problem-dialog" class="problem-dialog" aria-labelledby="problem-dialog-title">
     <form id="problem-form" class="problem-form">
       <div class="dialog-header">
@@ -262,6 +295,6 @@
 
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=16"></script>
 </body>
 </html>

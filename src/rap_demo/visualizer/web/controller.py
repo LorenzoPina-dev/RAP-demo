@@ -102,6 +102,9 @@ class SearchController:
         initial_status: Optional[SearchStatus] = None,
         on_finish: Optional[Callable[[SearchController], Any]] = None,
         llm: Optional[Any] = None,
+        replay_path: Optional[list[MCTSNode]] = None,
+        replay_index: int = 0,
+        replay_meta: Optional[dict[str, Any]] = None,
     ) -> None:
         self.mcts: Optional[MCTS] = mcts
         if llm is None and mcts is not None:
@@ -127,6 +130,25 @@ class SearchController:
         self._running_task: Optional[asyncio.Task[None]] = None
         self._active_loop: Optional[asyncio.AbstractEventLoop] = None
         self._active_iteration: int = 0
+
+        # Replay mode: walk a cached trajectory without invoking the LLM or MCTS.
+        self._replay_path: Optional[list[MCTSNode]] = (
+            list(replay_path) if replay_path else None
+        )
+        self._replay_meta: dict[str, Any] = dict(replay_meta or {})
+        self._live_snapshot: Optional[dict[str, Any]] = None
+        self._playing: bool = False
+
+        if self._replay_path is not None:
+            last_index = max(len(self._replay_path) - 1, 0)
+            self._iteration = max(0, min(int(replay_index), last_index))
+            self.max_iterations = last_index
+            self._status = (
+                SearchStatus.FINISHED
+                if self._iteration >= self.max_iterations
+                else (SearchStatus.IDLE if self._iteration == 0 else SearchStatus.PAUSED)
+            )
+            self._finish_notified = True
 
         if self.mcts is not None:
             if getattr(self.mcts, "event_bus", None) is None:
@@ -202,6 +224,9 @@ class SearchController:
 
     def get_best_path_ids(self) -> list[str]:
         """Returns serialized node IDs along the current best trajectory."""
+        if self._replay_path is not None:
+            index = min(self._iteration, len(self._replay_path) - 1)
+            return [f"node_{id(n)}" for n in self._replay_path[: index + 1]]
         traj = self._get_best_trajectory()
         return [f"node_{id(n)}" for n in traj]
 
@@ -209,6 +234,21 @@ class SearchController:
     def status(self) -> SearchStatus:
         """Current status of the search execution."""
         return self._status
+
+    @property
+    def is_replay(self) -> bool:
+        """True when the controller is walking a cached trajectory instead of searching."""
+        return self._replay_path is not None
+
+    @property
+    def can_exit_replay(self) -> bool:
+        """True when a live search state is available to restore after replay."""
+        return self._live_snapshot is not None
+
+    @property
+    def replay_meta(self) -> dict[str, Any]:
+        """Summary metadata of the run currently loaded in replay mode."""
+        return dict(self._replay_meta)
 
     @property
     def iteration(self) -> int:
@@ -223,10 +263,16 @@ class SearchController:
     @property
     def current_state(self) -> Any:
         """Current state at the most promising node of best trajectory."""
+        if self._replay_path is not None:
+            index = min(self._iteration, len(self._replay_path) - 1)
+            return self._replay_path[index].state
         return self._get_best_trajectory()[-1].state
 
     async def step(self) -> dict[str, Any]:
         """Runs exactly one MCTS iteration and emits events."""
+        if self._replay_path is not None:
+            return await self._replay_step()
+
         if self._iteration >= self.max_iterations:
             self._status = SearchStatus.FINISHED
             await self._notify_finish_once()
@@ -309,6 +355,50 @@ class SearchController:
             "root": self._root,
         }
 
+    async def _replay_step(self) -> dict[str, Any]:
+        """Advances the replay cursor along the cached trajectory without any LLM call."""
+        if self._iteration >= self.max_iterations:
+            self._status = SearchStatus.FINISHED
+            return {
+                "status": self._status,
+                "iteration": self._iteration,
+                "root": self._root,
+            }
+
+        self._iteration += 1
+        node = self._replay_path[self._iteration]
+        if self._iteration >= self.max_iterations:
+            self._status = SearchStatus.FINISHED
+        elif self._playing:
+            self._status = SearchStatus.RUNNING
+        else:
+            self._status = SearchStatus.PAUSED
+
+        thought = getattr(node, "thought", None) or (
+            getattr(node.action, "thought", None) if node.action else None
+        )
+        payload = {
+            "type": "step",
+            "iteration": self._iteration,
+            "max_iterations": self.max_iterations,
+            "status": self._status.value,
+            "tree": serialize_tree(self._root),
+            "best_node_id": f"node_{id(node)}",
+            "best_path_ids": self.get_best_path_ids(),
+            "thought": thought,
+            "replay": True,
+        }
+        await self.emit_event("step", payload)
+
+        if self._status == SearchStatus.FINISHED:
+            await self._notify_finish_once()
+
+        return {
+            "status": self._status,
+            "iteration": self._iteration,
+            "root": self._root,
+        }
+
     async def start(self) -> dict[str, Any]:
         """Starts continuous search execution in background."""
         if self._status == SearchStatus.RUNNING:
@@ -319,6 +409,7 @@ class SearchController:
             return {"status": self._status, "iteration": self._iteration}
 
         self._status = SearchStatus.RUNNING
+        self._playing = True
         self._running_task = asyncio.create_task(self._run_loop())
         await self.emit_event(
             "start",
@@ -349,12 +440,14 @@ class SearchController:
                 },
             )
         finally:
+            self._playing = False
             if self._iteration >= self.max_iterations:
                 self._status = SearchStatus.FINISHED
 
     async def pause(self) -> dict[str, Any]:
         """Pauses running search execution."""
         if self._status == SearchStatus.RUNNING:
+            self._playing = False
             self._status = SearchStatus.PAUSED
             if self._running_task and not self._running_task.done():
                 self._running_task.cancel()
@@ -378,26 +471,126 @@ class SearchController:
             self._running_task.cancel()
             self._running_task = None
 
+        self._playing = False
         self._status = SearchStatus.IDLE
         self._iteration = 0
+
+        if self._replay_path is not None:
+            # Replay reset rewinds the cursor and keeps the cached tree intact.
+            await self.emit_event("reset", self._reset_payload())
+            return {"status": self._status, "iteration": self._iteration}
+
         self._finish_notified = False
         self._root = MCTSNode(state=self.initial_state, depth=0)
 
-        payload = {
+        await self.emit_event("reset", self._reset_payload())
+
+        return {"status": self._status, "iteration": self._iteration}
+
+    def _reset_payload(self) -> dict[str, Any]:
+        """Builds the SSE payload shared by live and replay resets."""
+        return {
             "type": "reset",
-            "iteration": 0,
+            "iteration": self._iteration,
             "max_iterations": self.max_iterations,
             "status": self._status.value,
             "goal": self.goal,
+            "mode": self.mode,
             "tree": serialize_tree(self._root),
             "best_path_ids": self.get_best_path_ids(),
+            "replay": self._replay_path is not None,
+            "run": dict(self._replay_meta),
         }
-        await self.emit_event("reset", payload)
 
+    async def enter_replay(
+        self,
+        root: MCTSNode,
+        replay_path: list[MCTSNode],
+        goal: Any = None,
+        mode: Optional[str] = None,
+        run_meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Switches to replay mode using a cached tree; no LLM or MCTS calls are made."""
+        if self._running_task and not self._running_task.done():
+            self._running_task.cancel()
+            self._running_task = None
+        self._playing = False
+
+        if self._replay_path is None:
+            self._live_snapshot = {
+                "mcts": self.mcts,
+                "llm": self.llm,
+                "root": self._root,
+                "initial_state": self.initial_state,
+                "goal": self.goal,
+                "mode": self.mode,
+                "iteration": self._iteration,
+                "max_iterations": self.max_iterations,
+                "status": self._status,
+            }
+
+        self.mcts = None
+        self.llm = None
+        self._root = root
+        self._replay_path = list(replay_path) if replay_path else [root]
+        self._replay_meta = dict(run_meta or {})
+        self.initial_state = root.state
+        self.goal = goal
+        self.mode = mode
+        self._iteration = 0
+        self.max_iterations = max(len(self._replay_path) - 1, 0)
+        self._status = SearchStatus.IDLE
+        self._finish_notified = True
+
+        await self.emit_event("reset", self._reset_payload())
+        return {"status": self._status, "iteration": self._iteration}
+
+    async def exit_replay(self) -> dict[str, Any]:
+        """Restores the live search state captured when replay mode was entered."""
+        if self._replay_path is None:
+            return {"status": self._status, "iteration": self._iteration}
+
+        if self._running_task and not self._running_task.done():
+            self._running_task.cancel()
+            self._running_task = None
+        self._playing = False
+
+        snapshot = self._live_snapshot
+        self._live_snapshot = None
+        self._replay_path = None
+        self._replay_meta = {}
+
+        if snapshot is not None:
+            self.mcts = snapshot["mcts"]
+            self.llm = snapshot["llm"]
+            self._root = snapshot["root"]
+            self.initial_state = snapshot["initial_state"]
+            self.goal = snapshot["goal"]
+            self.mode = snapshot["mode"]
+            self._iteration = snapshot["iteration"]
+            self.max_iterations = snapshot["max_iterations"]
+            self._status = (
+                SearchStatus.PAUSED
+                if snapshot["status"] == SearchStatus.RUNNING
+                else snapshot["status"]
+            )
+            self._finish_notified = snapshot["status"] == SearchStatus.FINISHED
+        else:
+            self.mcts = None
+            self.llm = None
+            self._root = MCTSNode(state=self.initial_state, depth=0)
+            self._iteration = 0
+            self.max_iterations = 0
+            self._status = SearchStatus.IDLE
+            self._finish_notified = False
+
+        await self.emit_event("reset", self._reset_payload())
         return {"status": self._status, "iteration": self._iteration}
 
     async def set_problem(self, initial_state: Any, goal: Any) -> dict[str, Any]:
         """Replaces the problem definition (initial state and goal) and resets the search."""
+        if self._replay_path is not None:
+            await self.exit_replay()
         self.initial_state = initial_state
         self.goal = goal
         self._apply_goal_to_components(goal)
