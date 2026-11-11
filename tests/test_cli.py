@@ -9,6 +9,9 @@ Contracts tested:
      - `--backend`: LLM backend identifier ("mock" | "llama-server", default: "mock").
      - `--iterations`: MCTS search cycles (default: 10, type: int).
      - `--verbose` / `-v`: detailed terminal output (flag, default: False).
+     - `--initial-state`: initial Blocksworld state as JSON or canonical English (default: None).
+     - `--goal`: repeatable goal condition (default: None).
+     - `--max-depth`: MCTS depth limit L (default: 6, type: int).
    - Subcommand `ui`:
      - `--host`: visualizer bind address (default: "127.0.0.1").
      - `--port`: visualizer port (default: 8000, type: int).
@@ -48,7 +51,14 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from rich.console import Console
 
-from rap_demo.cli import build_parser, main
+from rap_demo.cli import (
+    DEFAULT_GOAL,
+    DEFAULT_INITIAL_STATE,
+    _parse_goal,
+    _parse_initial_state,
+    build_parser,
+    main,
+)
 from rap_demo.core.node import MCTSNode
 from rap_demo.domains.blocksworld.models import BlockState
 from rap_demo.llm.base import BaseLLM
@@ -109,9 +119,10 @@ class TestCLIParser:
         args = parser.parse_args(["run"])
         assert args.command == "run"
         assert args.domain == "blocksworld"
-        assert args.mode == "hybrid"
+        assert args.mode == "paper"
         assert args.backend == "mock"
         assert args.iterations == 10
+        assert args.max_depth == 6
         assert args.verbose is False
 
     def test_run_parser_custom_values(self, parser: argparse.ArgumentParser) -> None:
@@ -127,6 +138,8 @@ class TestCLIParser:
                 "llama-server",
                 "--iterations",
                 "25",
+                "--max-depth",
+                "9",
                 "--verbose",
             ]
         )
@@ -134,6 +147,7 @@ class TestCLIParser:
         assert args.mode == "paper"
         assert args.backend == "llama-server"
         assert args.iterations == 25
+        assert args.max_depth == 9
         assert args.verbose is True
 
     def test_run_parser_short_verbose_flag(self, parser: argparse.ArgumentParser) -> None:
@@ -164,6 +178,33 @@ class TestCLIParser:
         with pytest.raises(SystemExit):
             parser.parse_args(["run", "--iterations", "ten"])
 
+    def test_run_parser_problem_flags(self, parser: argparse.ArgumentParser) -> None:
+        """`rap run` accepts a custom initial state and repeatable goal conditions."""
+        args = parser.parse_args(
+            [
+                "run",
+                "--initial-state",
+                '{"clear": ["red"], "on_table": ["blue"]}',
+                "--goal",
+                "the red block is on top of the blue block",
+                "--goal",
+                "the blue block is on the table",
+            ]
+        )
+        assert args.initial_state == '{"clear": ["red"], "on_table": ["blue"]}'
+        assert args.goal == [
+            "the red block is on top of the blue block",
+            "the blue block is on the table",
+        ]
+
+    def test_problem_flags_default_to_none(self, parser: argparse.ArgumentParser) -> None:
+        """Problem flags default to None so the built-in demo problem is used."""
+        for subcommand in ("run", "ui", "compare"):
+            args = parser.parse_args([subcommand])
+            assert args.initial_state is None
+            assert args.goal is None
+            assert args.max_depth == 6
+
     # --- `ui` subcommand arguments ---
 
     def test_ui_parser_defaults(self, parser: argparse.ArgumentParser) -> None:
@@ -173,7 +214,7 @@ class TestCLIParser:
         assert args.host in ("127.0.0.1", "0.0.0.0", "localhost")
         assert args.port == 8000
         assert args.backend == "mock"
-        assert args.mode == "hybrid"
+        assert args.mode == "paper"
         assert args.iterations >= 10
         assert args.domain == "blocksworld"
 
@@ -397,6 +438,25 @@ class TestRunCommand:
 
         exit_code = main(["run", "--iterations", "-5"])
         assert exit_code != 0
+
+    def test_run_validates_max_depth_positive(self) -> None:
+        """`rap run` returns non-zero when the depth limit is not positive."""
+        assert main(["run", "--max-depth", "0"]) != 0
+        assert main(["run", "--max-depth", "-1"]) != 0
+
+    def test_run_forwards_max_depth_to_mcts(self) -> None:
+        """`rap run` passes the depth limit L to the MCTS engine (Algorithm 1)."""
+        with patch("rap_demo.cli.MCTS") as mock_mcts_cls:
+            mock_mcts = mock_mcts_cls.return_value
+            mock_mcts.search.return_value = MCTSNode(state="mock_state", depth=0)
+            mock_mcts.get_best_trajectory.return_value = [
+                MCTSNode(state="mock_state", reward=0.0)
+            ]
+
+            exit_code = main(["run", "--max-depth", "9", "--no-save"])
+
+        assert exit_code == 0
+        assert mock_mcts_cls.call_args.kwargs["max_depth"] == 9
 
 
 # ============================================================================
@@ -670,3 +730,109 @@ class TestCLIEndToEndIntegration:
                 assert res_state.status_code == 200
 
         asyncio.run(verify_app())
+
+
+# ============================================================================
+# 8. Problem Definition (initial state & goal) Tests
+# ============================================================================
+
+
+class TestProblemDefinition:
+    """Unit tests for `--initial-state` and `--goal` parsing helpers."""
+
+    def test_parse_initial_state_from_json(self) -> None:
+        """JSON specifications are converted into an equivalent BlockState."""
+        state = _parse_initial_state(
+            '{"clear": ["red"], "on_table": ["blue"], "on": {"red": "blue"}, "holding": null}'
+        )
+        assert state.clear == {"red"}
+        assert state.on_table == {"blue"}
+        assert state.on == {"red": "blue"}
+        assert state.holding is None
+
+    def test_parse_initial_state_from_text(self) -> None:
+        """Canonical English descriptions are parsed by BlockState.from_text()."""
+        state = _parse_initial_state(
+            "the red block is clear, the hand is empty, "
+            "the red block is on top of the blue block and the blue block is on the table."
+        )
+        assert state.clear == {"red"}
+        assert state.on_table == {"blue"}
+        assert state.on == {"red": "blue"}
+        assert state.holding is None
+
+    def test_parse_initial_state_keeps_demo_state_when_omitted(self) -> None:
+        """Omitting --initial-state keeps the built-in demo state."""
+        assert _parse_initial_state(None) == DEFAULT_INITIAL_STATE
+
+    @pytest.mark.parametrize(
+        "invalid_spec",
+        [
+            "",
+            "   ",
+            '{"clear": ["red"',
+            '{"clear": "red"}',
+            '{"clear": ["a"], "on": {"b": "a"}}',
+            '{"clear": ["a"], "on_table": ["a"], "on": {"a": "b"}}',
+            '{"holding": "a", "clear": ["a"]}',
+            "garbage",
+        ],
+    )
+    def test_parse_initial_state_rejects_invalid_specs(self, invalid_spec: str) -> None:
+        """Malformed or physically inconsistent specifications raise ValueError."""
+        with pytest.raises(ValueError):
+            _parse_initial_state(invalid_spec)
+
+    def test_parse_initial_state_detects_on_cycle(self) -> None:
+        """Cyclic 'on' relations are rejected."""
+        with pytest.raises(ValueError):
+            _parse_initial_state('{"on": {"a": "b", "b": "a"}}')
+
+    def test_parse_goal_splits_joined_conditions(self) -> None:
+        """Conditions joined by 'and' or commas are split into separate goals."""
+        goals = _parse_goal(
+            [
+                "the red block is on top of the blue block "
+                "and the orange block is on top of the red block."
+            ]
+        )
+        assert goals == [
+            "the red block is on top of the blue block",
+            "the orange block is on top of the red block",
+        ]
+
+    def test_parse_goal_keeps_demo_goal_when_omitted(self) -> None:
+        """Omitting --goal keeps the built-in demo goal."""
+        assert _parse_goal(None) == DEFAULT_GOAL
+
+    @pytest.mark.parametrize("invalid_goal", [[], [""], ["   "], [" . "]])
+    def test_parse_goal_rejects_empty_conditions(self, invalid_goal: list[str]) -> None:
+        """Goal specifications without a usable condition raise ValueError."""
+        with pytest.raises(ValueError):
+            _parse_goal(invalid_goal)
+
+    def test_run_accepts_custom_problem_definition(self) -> None:
+        """`rap run` executes with a custom initial state and goal."""
+        exit_code = main(
+            [
+                "run",
+                "--backend",
+                "mock",
+                "--iterations",
+                "2",
+                "--no-save",
+                "--initial-state",
+                '{"clear": ["red"], "on_table": ["blue"], "on": {"red": "blue"}}',
+                "--goal",
+                "the red block is on top of the blue block",
+            ]
+        )
+        assert exit_code == 0
+
+    def test_run_rejects_invalid_problem_definition(self) -> None:
+        """`rap run` returns non-zero for invalid initial state or goal specifications."""
+        exit_code = main(["run", "--iterations", "1", "--initial-state", '{"clear": "red"}'])
+        assert exit_code != 0
+
+        exit_code = main(["run", "--iterations", "1", "--goal", "  "])
+        assert exit_code != 0

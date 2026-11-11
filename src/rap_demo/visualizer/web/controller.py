@@ -13,6 +13,7 @@ from typing import Any, Optional
 from rap_demo.core.events import Event, EventBus, EventType
 from rap_demo.core.mcts import MCTS, extract_best_trajectory
 from rap_demo.core.node import MCTSNode
+from rap_demo.domains.blocksworld.prompts import format_goal
 from rap_demo.visualizer.serializer import _serialize_state, serialize_tree
 
 
@@ -58,6 +59,8 @@ def _build_tree_with_sim_preview(
             "action": str(sim_node.action) if sim_node.action is not None else None,
             "thought": getattr(sim_node, "thought", None)
             or (getattr(sim_node.action, "thought", None) if sim_node.action else None),
+            "llm_trace": getattr(sim_node, "llm_trace", None),
+            "llm_calls": list(getattr(sim_node, "llm_calls", None) or []),
             "visits": sim_node.N,
             "Q": float(sim_node.Q),
             "M": None,
@@ -385,12 +388,34 @@ class SearchController:
             "iteration": 0,
             "max_iterations": self.max_iterations,
             "status": self._status.value,
+            "goal": self.goal,
             "tree": serialize_tree(self._root),
             "best_path_ids": self.get_best_path_ids(),
         }
         await self.emit_event("reset", payload)
 
         return {"status": self._status, "iteration": self._iteration}
+
+    async def set_problem(self, initial_state: Any, goal: Any) -> dict[str, Any]:
+        """Replaces the problem definition (initial state and goal) and resets the search."""
+        self.initial_state = initial_state
+        self.goal = goal
+        self._apply_goal_to_components(goal)
+        return await self.reset()
+
+    def _apply_goal_to_components(self, goal: Any) -> None:
+        """Propagates a new goal to the MCTS reasoning agent and world model, when supported."""
+        if self.mcts is None:
+            return
+
+        goal_text = format_goal(goal)
+        agent = getattr(self.mcts, "reasoning_agent", None)
+        world_model = getattr(self.mcts, "world_model", None)
+
+        if agent is not None and hasattr(agent, "goal"):
+            agent.goal = goal_text
+        if world_model is not None and hasattr(world_model, "goal"):
+            world_model.goal = goal
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         """Subscribes an event queue for SSE streaming."""

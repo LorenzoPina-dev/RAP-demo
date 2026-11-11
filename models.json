@@ -1,7 +1,7 @@
 {
   "default_model": "gemma4-31b",
   "defaults": {
-    "mode": "hybrid",
+    "mode": "paper",
     "iterations": 10,
     "timeout": 30.0
   },
@@ -23,6 +23,19 @@
     "local-llama": {
       "backend": "llama-server",
       "api_base": "http://localhost:8080"
+    },
+    "qwen2.5-coder-3b": {
+      "backend": "litellm",
+      "model": "ollama/qwen2.5-coder:3b",
+      "api_base": "http://localhost:11434",
+      "timeout": 180.0
+    },
+    "gpt-oss-20b": {
+      "backend": "litellm",
+      "model": "ollama/gpt-oss:20b",
+      "api_base": "http://localhost:11434",
+      "timeout": 300.0,
+      "reasoning_effort": "low"
     }
   }
 }

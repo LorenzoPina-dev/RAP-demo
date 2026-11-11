@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import re
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -26,6 +26,7 @@ class BlockAction:
     block: str
     target: Optional[str] = None
     thought: Optional[str] = None
+    llm_trace: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         """Normalizes action_type to ActionType enum if string is supplied."""
@@ -49,6 +50,11 @@ class BlockAction:
             return f"Unstack the {self.block} block from on top of the {self.target} block."
         else:
             raise ValueError(f"Unknown action type: {self.action_type}")
+
+    def to_paper_text(self) -> str:
+        """Canonical continuation used by the RAP paper prompts (lowercase, no period)."""
+        text = self.to_text().rstrip(".")
+        return text[:1].lower() + text[1:]
 
     @classmethod
     def from_text(cls, text: str) -> BlockAction:
@@ -189,8 +195,10 @@ class BlockState:
             )
 
         elif atype == ActionType.PUT_DOWN.value:
-            # Preconditions: hand is holding the block
-            return self.holding == action.block
+            # Preconditions: hand is holding the block and no stack target is given.
+            # ``put_down`` always releases the block on the table; a non-null target
+            # means the caller wanted ``stack`` and must not be silently accepted.
+            return self.holding == action.block and action.target is None
 
         elif atype == ActionType.STACK.value:
             # Preconditions: holding block, target is clear, target != block, target is specified

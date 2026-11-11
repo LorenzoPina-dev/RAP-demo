@@ -52,6 +52,7 @@ from rap_demo.domains.blocksworld.rewards import (
     score_self_evaluation,
 )
 from rap_demo.domains.blocksworld.agent import BlocksworldAgent
+from rap_demo.domains.blocksworld.prompts import build_hybrid_action_prompt
 from rap_demo.domains.blocksworld.world_model import BlocksworldWorldModel
 from rap_demo.domains.blocksworld.domain import BlocksworldDomain
 from rap_demo.llm.mock import MockLLM
@@ -730,6 +731,88 @@ class TestBlocksworldRewards:
 class TestBlocksworldAgent:
     """Unit tests for BlocksworldAgent in hybrid and paper modes."""
 
+    def test_hybrid_prompt_includes_goal(self, instance_5_state: BlockState) -> None:
+        """Hybrid prompt must expose the goal so the model can plan towards it."""
+        goal = [
+            "the red block is on top of the blue block",
+            "the orange block is on top of the red block",
+        ]
+        prompt = build_hybrid_action_prompt(instance_5_state, goal)
+
+        assert "Goal:" in prompt
+        assert "the red block is on top of the blue block" in prompt
+        assert "the orange block is on top of the red block" in prompt
+        assert instance_5_state.to_text() in prompt
+
+    def test_hybrid_prompt_without_goal_omits_goal_line(
+        self, instance_5_state: BlockState
+    ) -> None:
+        """An empty goal keeps the prompt free of a dangling 'Goal:' line."""
+        prompt = build_hybrid_action_prompt(instance_5_state)
+
+        assert "Goal:" not in prompt
+        assert "Current State:" in prompt
+
+    def test_agent_hybrid_trace_captures_prompt_and_response(
+        self, instance_5_state: BlockState
+    ) -> None:
+        """A legal model proposal carries the exact prompt, raw response, and parsed payload."""
+        canned_json = json.dumps(
+            {
+                "thought": "Red is clear and needed on blue. Pick up red first.",
+                "action": "pick_up",
+                "block": "red",
+                "target": None,
+            }
+        )
+        mock_llm = MockLLM(default_response=canned_json)
+        agent = BlocksworldAgent(
+            llm=mock_llm,
+            goal="the red block is on top of the blue block",
+            mode="hybrid",
+        )
+
+        action = agent.get_actions(instance_5_state)[0]
+        trace = action.llm_trace
+
+        assert trace is not None
+        assert trace["source"] == "model"
+        assert trace["reason"] is None
+        assert trace["prompt"] == mock_llm.calls[0].prompt
+        assert "Goal:" in trace["prompt"]
+        assert trace["response"] == canned_json
+        assert trace["proposed"]["action"] == "pick_up"
+        assert trace["model"] == getattr(mock_llm, "model", None)
+
+    def test_agent_hybrid_fallback_trace_explains_rejected_output(
+        self, instance_5_state: BlockState
+    ) -> None:
+        """An illegal model proposal falls back to legal actions, keeping the trace and reason."""
+        illegal_json = json.dumps(
+            {
+                "thought": "Stack red onto blue",
+                "action": "stack",
+                "block": "red",
+                "target": "blue",
+            }
+        )
+        mock_llm = MockLLM(default_response=illegal_json)
+        agent = BlocksworldAgent(
+            llm=mock_llm,
+            goal="the red block is on top of the blue block",
+            mode="hybrid",
+        )
+
+        actions = agent.get_actions(instance_5_state)
+
+        assert actions, "Fallback must still expose legal actions"
+        for action in actions:
+            assert action.llm_trace is not None
+            assert action.llm_trace["source"] == "fallback"
+            assert "illegal action" in action.llm_trace["reason"]
+            assert action.llm_trace["response"] == illegal_json
+            assert action.thought is None
+
     def test_agent_hybrid_mode_proposes_actions_from_json(
         self, instance_5_state: BlockState
     ) -> None:
@@ -832,6 +915,93 @@ class TestBlocksworldWorldModel:
         assert mock_llm.call_count >= 1
         assert next_state.holding == "red"
         assert not is_terminal
+
+    def test_world_model_derives_clear_when_llm_omits_it(self) -> None:
+        """A missing "X is now clear" clause must not leave an impossible state.
+
+        Reproduces the artifact behind the inflated 0.7 reward: after stacking
+        red on blue the LLM marked blue as no longer clear but forgot that red
+        (the stacked block) is now clear.
+        """
+        state = BlockState(
+            clear={"blue", "orange"},
+            on_table={"blue", "yellow"},
+            on={"orange": "yellow"},
+            holding="red",
+        )
+        change = (
+            "[CHANGE] the hand was holding the red block and is now empty, "
+            "the red block was in the hand and is now on top of the blue block, "
+            "and the blue block is no longer clear."
+        )
+        mock_llm = MockLLM(default_response=change)
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        action = BlockAction(ActionType.STACK, "red", "blue")
+
+        next_state, _, _ = world_model.step(state, action)
+
+        assert next_state.on == {"red": "blue", "orange": "yellow"}
+        assert next_state.clear == {"red", "orange"}
+        assert next_state.on_table == {"blue", "yellow"}
+        assert "red" not in next_state.on_table
+
+    def test_world_model_derives_clear_after_stacking_on_yellow(self) -> None:
+        """After stacking orange on yellow, the top block orange must be clear."""
+        state = BlockState(
+            clear={"yellow"},
+            on_table={"blue", "yellow"},
+            on={"red": "blue"},
+            holding="orange",
+        )
+        change = (
+            "[CHANGE] the hand was holding the orange block and is now empty, "
+            "the orange block was in the hand and is now on top of the yellow block, "
+            "and the yellow block is no longer clear."
+        )
+        mock_llm = MockLLM(default_response=change)
+        world_model = BlocksworldWorldModel(
+            goal=["the orange block is on top of the yellow block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        action = BlockAction(ActionType.STACK, "orange", "yellow")
+
+        next_state, _, _ = world_model.step(state, action)
+
+        assert next_state.on == {"red": "blue", "orange": "yellow"}
+        assert next_state.clear == {"red", "orange"}
+        assert next_state.on_table == {"blue", "yellow"}
+
+    def test_world_model_keeps_held_block_out_of_table_and_clear(self) -> None:
+        """A held block is neither on the table nor clear, even if the LLM says so."""
+        state = BlockState(
+            clear={"red", "blue"},
+            on_table={"red", "blue"},
+            on={},
+            holding=None,
+        )
+        change = (
+            "[CHANGE] the hand was empty and is now holding the red block, "
+            "the red block was on the table and is now in the hand, "
+            "and the red block is now clear."
+        )
+        mock_llm = MockLLM(default_response=change)
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        action = BlockAction(ActionType.PICK_UP, "red")
+
+        next_state, _, _ = world_model.step(state, action)
+
+        assert next_state.holding == "red"
+        assert next_state.clear == {"blue"}
+        assert next_state.on_table == {"blue"}
 
     def test_world_model_detects_terminal_goal(self) -> None:
         """world_model marks is_terminal=True and returns high reward when goal is reached."""

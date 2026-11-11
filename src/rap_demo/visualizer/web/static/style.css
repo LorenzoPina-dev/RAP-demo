@@ -406,11 +406,93 @@ body {
 .workspace {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(320px, 390px);
-  grid-template-rows: minmax(280px, 1fr) minmax(235px, 275px);
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
   padding: 10px;
+  /* Ratio persisted by the resizable layout (percentage of the workspace). */
+  --split-top: 62%;
+}
+
+.workspace-top {
+  flex: 0 0 var(--split-top);
+  min-height: 0;
+  display: flex;
+  gap: 0;
+}
+
+/* ==========================================================================
+   Resizable Split Handles
+   ========================================================================== */
+
+.grid-splitter {
+  position: relative;
+  flex: 0 0 auto;
+  align-self: stretch;
+  z-index: 5;
+  background: transparent;
+  touch-action: none;
+  outline: none;
+}
+
+.grid-splitter::before {
+  content: "";
+  position: absolute;
+  background: var(--border-subtle);
+  border-radius: 999px;
+  transition: background 120ms ease;
+}
+
+.grid-splitter-col {
+  width: 10px;
+  cursor: col-resize;
+}
+
+.grid-splitter-col::before {
+  top: 6%;
+  bottom: 6%;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+}
+
+.grid-splitter-row {
+  height: 10px;
+  cursor: row-resize;
+}
+
+.grid-splitter-row::before {
+  left: 6%;
+  right: 6%;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.grid-splitter:hover::before,
+.grid-splitter:focus-visible::before,
+body.is-resizing .grid-splitter:hover::before {
+  background: var(--accent);
+}
+
+.grid-splitter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+body.is-resizing {
+  user-select: none;
+}
+
+body.is-resizing.is-resizing-col,
+body.is-resizing.is-resizing-col * {
+  cursor: col-resize !important;
+}
+
+body.is-resizing.is-resizing-row,
+body.is-resizing.is-resizing-row * {
+  cursor: row-resize !important;
 }
 
 .panel {
@@ -486,8 +568,8 @@ body {
    ========================================================================== */
 
 .tree-panel {
-  grid-column: 1 / 2;
-  grid-row: 1 / 2;
+  flex: 3.2 1 0;
+  min-width: 240px;
 }
 
 .tree-legend {
@@ -720,8 +802,8 @@ svg.tree-svg {
    ========================================================================== */
 
 .tabletop-panel {
-  grid-column: 2 / 3;
-  grid-row: 1 / 2;
+  flex: 1 1 0;
+  min-width: 240px;
 }
 
 .goal-strip {
@@ -883,8 +965,8 @@ svg.tree-svg {
    ========================================================================== */
 
 .inspector-panel {
-  grid-column: 1 / 3;
-  grid-row: 2 / 3;
+  flex: 1 1 0;
+  min-height: 150px;
 }
 
 .trajectory-strip {
@@ -956,10 +1038,11 @@ svg.tree-svg {
   flex: 1;
   min-height: 0;
   padding: 10px 12px;
-  display: grid;
-  grid-template-columns: 1.25fr 1fr 1fr;
-  gap: 10px;
-  overflow-y: auto;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .inspector-card {
@@ -970,12 +1053,34 @@ svg.tree-svg {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  flex: 1 1 0;
+  min-width: 150px;
   min-height: 0;
   overflow: hidden;
 }
 
 .thought-card {
   border-left: 2px solid var(--accent);
+}
+
+.inspector-content > .thought-card {
+  flex-grow: 1.05;
+}
+
+.inspector-content > .model-io-card {
+  flex-grow: 1.45;
+}
+
+.inspector-content > .llm-calls-card {
+  flex-grow: 1.35;
+}
+
+.inspector-content > .metrics-card {
+  flex-grow: 0.85;
+}
+
+.inspector-content > .state-card {
+  flex-grow: 1;
 }
 
 .card-header-row {
@@ -1005,6 +1110,106 @@ svg.tree-svg {
 .empty-hint {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+/* Model Input / Output card */
+.model-io-card {
+  border-left: 2px solid var(--border-strong);
+}
+
+.llm-calls-card {
+  border-left: 2px solid var(--accent);
+}
+
+.path-calls {
+  margin-top: 6px;
+}
+
+.path-call-group {
+  padding: 4px 0 2px;
+  border-top: 1px dashed var(--border-subtle);
+}
+
+.path-call-group .io-block {
+  margin-top: 4px;
+}
+
+.call-error > summary {
+  color: var(--status-danger);
+}
+
+.call-block .io-pre {
+  max-height: 180px;
+}
+
+.model-io {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.io-block {
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.io-block > summary {
+  cursor: pointer;
+  padding: 5px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.io-block > summary:hover {
+  color: var(--text-secondary);
+}
+
+.io-pre {
+  margin: 0;
+  padding: 7px 9px;
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 130px;
+  overflow-y: auto;
+}
+
+.trace-warning {
+  padding: 6px 9px;
+  border-left: 2px solid var(--status-danger);
+  background: var(--status-danger-soft);
+  border-radius: 4px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-primary);
+}
+
+.trace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.subtle-pill.danger {
+  color: var(--status-danger);
+  border-color: var(--status-danger);
+  background: var(--status-danger-soft);
 }
 
 .thought-quote {
@@ -1179,6 +1384,103 @@ svg.tree-svg {
 }
 
 /* ==========================================================================
+   Problem Editor Dialog
+   ========================================================================== */
+
+.problem-dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+}
+
+.problem-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.problem-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dialog-header h2 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.dialog-hint {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.problem-input {
+  width: 100%;
+  padding: 9px 11px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.problem-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.dialog-error {
+  padding: 9px 11px;
+  border: 1px solid var(--status-danger);
+  border-left: 3px solid var(--status-danger);
+  border-radius: 6px;
+  background: var(--status-danger-soft);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* ==========================================================================
    Responsive Breakpoints
    ========================================================================== */
 
@@ -1190,27 +1492,42 @@ svg.tree-svg {
   }
 
   .workspace {
-    grid-template-columns: 1fr;
-    grid-template-rows: 460px 340px auto;
+    flex: 0 0 auto;
+    --split-top: auto;
+  }
+
+  .workspace-top {
+    flex: 0 0 auto;
+    flex-direction: column;
   }
 
   .tree-panel {
-    grid-column: 1 / 2;
-    grid-row: 1 / 2;
+    flex: 0 0 460px;
+    min-width: 0;
   }
 
   .tabletop-panel {
-    grid-column: 1 / 2;
-    grid-row: 2 / 3;
+    flex: 0 0 340px;
+    min-width: 0;
+  }
+
+  .grid-splitter {
+    display: none;
   }
 
   .inspector-panel {
-    grid-column: 1 / 2;
-    grid-row: 3 / 4;
+    flex: 0 0 auto;
+    min-height: 0;
   }
 
   .inspector-content {
-    grid-template-columns: 1fr;
+    flex: 0 0 auto;
+    flex-direction: column;
+    overflow: visible;
+  }
+
+  .inspector-content > .inspector-card {
+    flex: 0 0 260px;
   }
 
   .trajectory-strip {

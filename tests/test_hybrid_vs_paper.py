@@ -357,7 +357,7 @@ class TestEndToEndMCTSComparison:
                 "block": "orange",
                 "target": "red",
             })),
-            (re.compile(r"red block is on top of the blue block"), json.dumps({
+            (re.compile(r"Current State: [^\n]*red block is on top of the blue block"), json.dumps({
                 "thought": "Unstack orange from yellow",
                 "action": "unstack",
                 "block": "orange",

@@ -17,6 +17,8 @@ class MCTSNode:
         reward: float = 0.0,
         is_terminal: bool = False,
         thought: Optional[str] = None,
+        llm_trace: Optional[dict[str, Any]] = None,
+        llm_calls: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self.state = state
         self.action = action
@@ -27,11 +29,17 @@ class MCTSNode:
         self.visited: bool = False
         self.is_terminal: bool = is_terminal
         self.thought: Optional[str] = thought
+        self.llm_trace: Optional[dict[str, Any]] = llm_trace
+        # Every LLM interaction performed while expanding this node:
+        # action scoring calls first, then one world-model call per action.
+        self.llm_calls: list[dict[str, Any]] = list(llm_calls or [])
 
         # MCTS Statistics
         self.N: int = 0  # Visit count N(s)
         self.Q: float = 0.0  # Mean action value Q(s, a)
         self.M: float = -math.inf  # Max action value M(s, a)
+        # Prior value used by UCT for not-yet-visited children (RAP Appendix A).
+        self.prior: float = 1.0
 
     @property
     def is_leaf(self) -> bool:
@@ -61,6 +69,8 @@ class MCTSNode:
             child_node.action = action
             if getattr(action, "thought", None) and not child_node.thought:
                 child_node.thought = getattr(action, "thought")
+            if getattr(action, "llm_trace", None) and not child_node.llm_trace:
+                child_node.llm_trace = getattr(action, "llm_trace")
         self.children.append(child_node)
         return child_node
 

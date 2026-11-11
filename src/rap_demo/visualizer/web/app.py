@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from rap_demo.domains.blocksworld.models import BlockState
+from rap_demo.domains.blocksworld.problem import parse_goal, parse_initial_state
 from rap_demo.llm.base import LLMError
 from rap_demo.visualizer.serializer import serialize_blocksworld_state, serialize_tree
 from rap_demo.visualizer.web.controller import SearchController
@@ -23,6 +24,21 @@ class SearchConfigRequest(BaseModel):
     """Request payload for updating live search playback configuration."""
 
     step_delay_ms: int = Field(..., ge=10, le=2000, description="Delay between iterations in milliseconds")
+
+
+class ProblemRequest(BaseModel):
+    """Request payload for replacing the Blocksworld problem definition."""
+
+    initial_state: str = Field(
+        ...,
+        min_length=1,
+        description="Initial state as JSON object or canonical English description",
+    )
+    goal: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Natural language goal conditions (one or more)",
+    )
 
 
 class _NoCacheStaticFiles(StaticFiles):
@@ -76,13 +92,38 @@ def create_app(controller: Optional[SearchController] = None) -> FastAPI:
     @server.get("/api/meta")
     async def get_meta() -> dict[str, Any]:
         """Returns visualizer configuration, goal context, and trajectory metadata."""
+        initial_state = ctrl.initial_state
+        initial_state_text = (
+            initial_state.to_text() if isinstance(initial_state, BlockState) else str(initial_state)
+        )
         return {
             "max_iterations": ctrl.max_iterations,
             "step_delay_ms": round(ctrl.step_delay * 1000),
             "mode": ctrl.mode,
             "goal": ctrl.goal,
+            "initial_state": initial_state_text,
             "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
             "iteration": ctrl.iteration,
+            "best_path_ids": ctrl.get_best_path_ids(),
+        }
+
+    @server.post("/api/problem")
+    async def post_problem(problem: ProblemRequest) -> dict[str, Any]:
+        """Replaces the initial state and goal, resetting the MCTS tree."""
+        try:
+            initial_state = parse_initial_state(problem.initial_state)
+            goal = parse_goal(problem.goal)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        await ctrl.set_problem(initial_state, goal)
+        return {
+            "iteration": ctrl.iteration,
+            "max_iterations": ctrl.max_iterations,
+            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "goal": ctrl.goal,
+            "state": serialize_blocksworld_state(initial_state),
+            "tree": serialize_tree(ctrl.root),
             "best_path_ids": ctrl.get_best_path_ids(),
         }
 

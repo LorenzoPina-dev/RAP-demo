@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 from rap_demo.core.mcts import WorldModel
 from rap_demo.domains.blocksworld.models import ActionType, BlockAction, BlockState
 from rap_demo.domains.blocksworld.prompts import build_world_update_prompt
@@ -16,6 +16,10 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
     cleaned = change_text.strip()
     # Remove prefix like [CHANGE]
     cleaned = re.sub(r"^\[change\]:?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    # Normalize "and is now" / "and are now" to the canonical "and now is" form
+    # used by the paper's demonstrations.
+    cleaned = re.sub(r"\band\s+is\s+now\b", "and now is", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\band\s+are\s+now\b", "and now are", cleaned, flags=re.IGNORECASE)
 
     # Reject hallucinated / impossible change texts
     hallucination_indicators = ["disappear", "destroy", "vanish", "teleport", "unknown", "invalid", "broken"]
@@ -112,12 +116,72 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
     if not matched_any:
         raise ValueError(f"No recognized state change in text: {change_text!r}")
 
+    # ``clear`` and ``on_table`` are logical consequences of the stack relations:
+    # the prompt defines a block as clear iff nothing is on top of it and it is
+    # not held. The LLM occasionally omits one of those clauses (for instance it
+    # marks the target as no longer clear but forgets that the stacked block is
+    # now clear), which used to leave an impossible state and collapse the legal
+    # action space. Rebuild the derived sets from the predicted ``on``/``holding``
+    # relations, as the paper's state definition requires.
+    blocks = (
+        set(state.clear)
+        | set(state.on_table)
+        | set(state.on)
+        | set(state.on.values())
+        | set(new_clear)
+        | set(new_on_table)
+        | set(new_on)
+        | set(new_on.values())
+    )
+    if new_holding:
+        blocks.add(new_holding)
+        # A held block cannot also be on the table or on top of another block.
+        new_on.pop(new_holding, None)
+        new_on_table.discard(new_holding)
+        if new_holding in new_on.values():
+            raise ValueError(
+                f"The held block {new_holding!r} cannot have blocks on top of it: {new_on!r}"
+            )
+
+    for top, bottom in new_on.items():
+        if top == bottom:
+            raise ValueError(f"A block cannot be stacked on itself: {top!r}")
+
+    for start in new_on:
+        chain: set[str] = set()
+        current = start
+        while current in new_on:
+            if current in chain:
+                raise ValueError(f"Cyclic block configuration predicted: {new_on!r}")
+            chain.add(current)
+            current = new_on[current]
+
+    new_clear = {b for b in blocks if b not in new_on.values() and b != new_holding}
+    new_on_table = {b for b in blocks if b not in new_on and b != new_holding}
+
     return BlockState(
         clear=new_clear,
         on_table=new_on_table,
         on=new_on,
         holding=new_holding,
     )
+
+
+def _action_likelihood(action: BlockAction) -> float:
+    """Returns r1 for an action: its normalized likelihood in [0, 1].
+
+    Paper mode stores the softmax-normalized log-probability on the action trace.
+    Modes that do not score actions fall back to 1.0, matching the original
+    "action is always plausible" behaviour.
+    """
+    trace = getattr(action, "llm_trace", None) or {}
+    probability = trace.get("prob")
+    if probability is None:
+        return 1.0
+    try:
+        return max(0.0, min(1.0, float(probability)))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 class BlocksworldWorldModel(WorldModel):
@@ -135,16 +199,58 @@ class BlocksworldWorldModel(WorldModel):
         self.mode = mode
         self.alpha = alpha
 
-    def step(self, state: BlockState, action: BlockAction) -> tuple[BlockState, float, bool]:
-        """Given current state and action, returns (next_state, immediate_reward, is_terminal)."""
-        if self.mode == "hybrid":
+    def step(
+        self,
+        state: BlockState,
+        action: BlockAction,
+        lightweight: bool = False,
+        call_log: list[dict[str, Any]] | None = None,
+    ) -> tuple[BlockState, float, bool]:
+        """Given current state and action, returns (next_state, immediate_reward, is_terminal).
+
+        The immediate reward follows the paper's Blocksworld reward (Section 4.1):
+        r1 is the action likelihood (log-probability, stored on the action trace)
+        and r2 is the fraction of goal conditions met by the predicted state.
+
+        Args:
+            lightweight: When True, skip the LLM world model and use the exact
+                physics simulator. MCTS rollouts request this, mirroring the
+                paper's "lightweight reward" used during simulation.
+            call_log: Optional sink receiving one dict per LLM call, so the
+                inspector can show the exact world-model prompt and response.
+        """
+        if self.mode == "hybrid" or lightweight:
             next_state = state.apply_action(action)
         elif self.mode == "paper":
             if self.llm is None:
                 raise ValueError("LLM backend is required for paper mode world model simulation")
             prompt = build_world_update_prompt(state, action)
-            change_text = self.llm.generate(prompt)
-            next_state = _apply_text_change(state, change_text)
+            change_text = self.llm.generate(
+                prompt,
+                max_tokens=2048,
+                temperature=0.8,
+                stop=["[STATE 1]"],
+            )
+            entry: dict[str, Any] | None = None
+            if call_log is not None:
+                entry = {
+                    "phase": "world-model",
+                    "action": action.to_text(),
+                    "prompt": prompt,
+                    "response": change_text,
+                    "logprob": None,
+                    "prob": None,
+                    "source": "world-model",
+                    "reason": None,
+                    "error": None,
+                }
+                call_log.append(entry)
+            try:
+                next_state = _apply_text_change(state, change_text)
+            except ValueError as exc:
+                if entry is not None:
+                    entry["error"] = str(exc)
+                raise
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -152,13 +258,14 @@ class BlocksworldWorldModel(WorldModel):
         is_terminal = goal_reward >= 100.0
 
         if is_terminal:
+            # The paper assigns a "super large reward" when every goal condition holds.
             step_reward = goal_reward
         else:
             step_reward = calculate_combined_reward(
                 state=next_state,
                 action=action,
                 goals=self.goal,
-                action_score=1.0,
+                action_score=_action_likelihood(action),
                 alpha=self.alpha,
             )
 

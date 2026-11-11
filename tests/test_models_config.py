@@ -176,6 +176,7 @@ class TestModelProfileAndModelsConfig:
         assert minimal.timeout is None
         assert minimal.mode is None
         assert minimal.iterations is None
+        assert minimal.reasoning_effort is None
 
         full = ModelProfile(
             alias="gemma4-26b",
@@ -187,11 +188,13 @@ class TestModelProfileAndModelsConfig:
             timeout=60.0,
             mode="hybrid",
             iterations=15,
+            reasoning_effort="low",
         )
         assert full.tpm == 15000
         assert full.rpm == 30
         assert full.timeout == 60.0
         assert full.iterations == 15
+        assert full.reasoning_effort == "low"
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -455,9 +458,12 @@ class TestModelsConfigCLIIntegration:
         assert isinstance(created_llms[0], MockLLM)
 
     def test_cli_models_subcommand_lists_configured_models_and_handles_empty(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """rap models prints Rich table of models.json entries and handles empty config gracefully."""
+        # Rich shrinks table cells to the detected terminal width; pin a wide console.
+        monkeypatch.setenv("COLUMNS", "200")
+
         # 1. Empty config in CWD
         empty_cfg = tmp_path / "empty.json"
         empty_cfg.write_text("{}", encoding="utf-8")
@@ -653,3 +659,40 @@ class TestModelsConfigCLIIntegration:
             c.kwargs.get("api_base") == "https://override.example.com/v1"
             for c in mock_comp.call_args_list
         )
+
+    def test_cli_forwards_reasoning_effort_from_profile(self, tmp_path: Path) -> None:
+        """`reasoning_effort` in models.json reaches the LiteLLM client (needed by reasoning models)."""
+        cfg_file = _write_models_json(
+            tmp_path / "models.json",
+            {
+                "models": {
+                    "reasoning-model": {
+                        "backend": "litellm",
+                        "model": "ollama/gpt-oss:20b",
+                        "api_base": "http://localhost:11434",
+                        "reasoning_effort": "low",
+                    }
+                }
+            },
+        )
+
+        created_llms: list[Any] = []
+        orig_create = _create_llm
+
+        def spy_create(*args: Any, **kwargs: Any) -> Any:
+            llm = orig_create(*args, **kwargs)
+            created_llms.append(llm)
+            return llm
+
+        with (
+            patch("rap_demo.cli._create_llm", side_effect=spy_create),
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            rc = main(["ui", "--model", "reasoning-model", "--config", str(cfg_file)])
+
+        assert rc == 0
+        mock_uvicorn.assert_called_once()
+        client = created_llms[0]
+        assert isinstance(client, LiteLLMClient)
+        assert client.model == "ollama/gpt-oss:20b"
+        assert client.reasoning_effort == "low"

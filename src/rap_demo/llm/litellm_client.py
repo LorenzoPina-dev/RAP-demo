@@ -245,6 +245,7 @@ class LiteLLMClient(BaseLLM):
         sleeper: Callable[[float], None] | None = None,
         config_path: str | Path | None = None,
         on_token: Callable[[str, str], None] | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Initialize LiteLLM client.
 
@@ -287,6 +288,7 @@ class LiteLLMClient(BaseLLM):
         self._completion_fn: Callable[..., Any] | None = completion_fn
         self._call_count: int = 0
         self.on_token: Callable[[str, str], None] | None = on_token
+        self.reasoning_effort: str | None = reasoning_effort
 
         if rate_limiter is not None:
             self.rate_limiter: TokenRateLimiter | None = rate_limiter
@@ -327,6 +329,8 @@ class LiteLLMClient(BaseLLM):
             kwargs["api_key"] = self.api_key
         if self.api_base is not None:
             kwargs["api_base"] = self.api_base
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         kwargs.update(extra)
         return kwargs
 

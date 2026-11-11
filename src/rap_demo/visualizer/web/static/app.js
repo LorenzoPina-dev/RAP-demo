@@ -11,6 +11,8 @@ class VisualizerApp {
     this.status = "idle";
     this.iteration = 0;
     this.maxIterations = 50;
+    this.goal = null;
+    this.initialStateText = "";
     this.selectedNode = null;
     this.bestPathIds = new Set();
     this.bestPathNodes = [];
@@ -44,6 +46,7 @@ class VisualizerApp {
 
     this.initElements();
     this.initTheme();
+    this.initResizableLayout();
     this.bindEvents();
     this.connectSSE();
     this.fetchInitialData();
@@ -85,12 +88,26 @@ class VisualizerApp {
     this.stacksArea = document.getElementById("stacks-area");
     this.heldBlockSlot = document.getElementById("held-block-slot");
 
+    this.btnEditProblem = document.getElementById("btn-edit-problem");
+    this.problemDialog = document.getElementById("problem-dialog");
+    this.problemForm = document.getElementById("problem-form");
+    this.problemGoal = document.getElementById("problem-goal");
+    this.problemState = document.getElementById("problem-state");
+    this.problemError = document.getElementById("problem-error");
+    this.btnProblemCancel = document.getElementById("btn-problem-cancel");
+    this.btnProblemClose = document.getElementById("btn-problem-close");
+    this.btnProblemApply = document.getElementById("btn-problem-apply");
+
     this.trajectoryStrip = document.getElementById("trajectory-strip");
     this.btnFollowBest = document.getElementById("btn-follow-best");
     this.tabOverview = document.getElementById("tab-overview");
     this.tabRaw = document.getElementById("tab-raw");
     this.thoughtModeTag = document.getElementById("thought-mode-tag");
     this.thoughtDisplay = document.getElementById("thought-display");
+    this.modelIo = document.getElementById("model-io");
+    this.traceSourceBadge = document.getElementById("trace-source-badge");
+    this.llmCalls = document.getElementById("llm-calls");
+    this.llmCallsBadge = document.getElementById("llm-calls-badge");
     this.nodeIdBadge = document.getElementById("node-id-badge");
     this.terminalBadge = document.getElementById("terminal-badge");
     this.metricsOverview = document.getElementById("metrics-overview");
@@ -132,6 +149,22 @@ class VisualizerApp {
       this.btnReset.addEventListener("click", () => {
         this.hasManualViewport = false;
         this.postAction("/api/search/reset");
+      });
+    }
+
+    if (this.btnEditProblem) {
+      this.btnEditProblem.addEventListener("click", () => this.openProblemDialog());
+    }
+    if (this.btnProblemCancel) {
+      this.btnProblemCancel.addEventListener("click", () => this.closeProblemDialog());
+    }
+    if (this.btnProblemClose) {
+      this.btnProblemClose.addEventListener("click", () => this.closeProblemDialog());
+    }
+    if (this.problemForm) {
+      this.problemForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        this.applyProblem();
       });
     }
 
@@ -306,6 +339,110 @@ class VisualizerApp {
     }
   }
 
+  openProblemDialog() {
+    if (!this.problemDialog) return;
+    this.hideProblemError();
+    if (this.problemGoal) {
+      this.problemGoal.value = Array.isArray(this.goal) ? this.goal.join("\n") : (this.goal || "");
+    }
+    if (this.problemState) {
+      this.problemState.value = this.initialStateText || "";
+    }
+    if (typeof this.problemDialog.showModal === "function") {
+      this.problemDialog.showModal();
+    } else {
+      this.problemDialog.setAttribute("open", "");
+    }
+    if (this.problemGoal) this.problemGoal.focus();
+  }
+
+  closeProblemDialog() {
+    if (!this.problemDialog) return;
+    this.hideProblemError();
+    if (typeof this.problemDialog.close === "function") {
+      this.problemDialog.close();
+    } else {
+      this.problemDialog.removeAttribute("open");
+    }
+  }
+
+  showProblemError(message) {
+    if (!this.problemError) return;
+    this.problemError.textContent = message;
+    this.problemError.hidden = false;
+  }
+
+  hideProblemError() {
+    if (!this.problemError) return;
+    this.problemError.textContent = "";
+    this.problemError.hidden = true;
+  }
+
+  async applyProblem() {
+    if (!this.problemState || !this.problemGoal) return;
+    this.hideProblemError();
+
+    const goal = this.problemGoal.value
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (goal.length === 0) {
+      this.showProblemError("Add at least one goal condition.");
+      return;
+    }
+
+    if (this.btnProblemApply) this.btnProblemApply.disabled = true;
+    try {
+      const res = await fetch("/api/problem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ initial_state: this.problemState.value, goal }),
+      });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson && errJson.detail) {
+            detail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
+          }
+        } catch (_) {}
+        throw new Error(detail);
+      }
+
+      const data = await res.json();
+      this.goal = data.goal || goal;
+      this.initialStateText = this.problemState.value;
+      this.closeProblemDialog();
+
+      this.liveStream.active = false;
+      this.liveElements = null;
+      this.selectedNode = null;
+      this.hasManualViewport = false;
+
+      if (data.max_iterations !== undefined) this.maxIterations = data.max_iterations;
+      if (Array.isArray(data.best_path_ids)) {
+        this.bestPathIds = new Set(data.best_path_ids);
+      }
+      this.renderGoal(this.goal);
+      this.updateStatus(data.status, data.iteration);
+      if (data.tree) {
+        this.treeData = data.tree;
+        this.syncTreeAndSelection(true);
+      }
+      if (data.state) {
+        this.stateData = data.state;
+        this.renderTabletop();
+        this.renderStateOverview(data.state, data.state);
+      }
+      this.showToast("Problem updated. Press Play to start the new search.");
+    } catch (err) {
+      console.error("Failed to apply problem:", err);
+      this.showProblemError(`Problem rejected: ${err.message}`);
+    } finally {
+      if (this.btnProblemApply) this.btnProblemApply.disabled = false;
+    }
+  }
+
   async postAction(endpoint) {
     const isStep = endpoint.endsWith("/step");
     if (isStep) {
@@ -469,6 +606,12 @@ class VisualizerApp {
     if (Array.isArray(meta.best_path_ids)) {
       this.bestPathIds = new Set(meta.best_path_ids);
     }
+    if (meta.goal !== undefined) {
+      this.goal = meta.goal;
+    }
+    if (typeof meta.initial_state === "string") {
+      this.initialStateText = meta.initial_state;
+    }
     this.renderGoal(meta.goal);
     this.updateStatus(meta.status, meta.iteration);
   }
@@ -539,6 +682,10 @@ class VisualizerApp {
     }
     if (payload.status) {
       this.updateStatus(payload.status, payload.iteration);
+    }
+    if (payload.goal !== undefined) {
+      this.goal = payload.goal;
+      this.renderGoal(payload.goal);
     }
 
     if (payload.type === "error" && payload.message) {
@@ -711,6 +858,19 @@ class VisualizerApp {
     if (root.children) {
       for (const child of root.children) {
         const res = this.findNodeById(child, id);
+        if (res) return res;
+      }
+    }
+    return null;
+  }
+
+  findNodePath(root, id, trail = []) {
+    if (!root) return null;
+    const nextTrail = [...trail, root];
+    if (root.id === id) return nextTrail;
+    if (root.children) {
+      for (const child of root.children) {
+        const res = this.findNodePath(child, id, nextTrail);
         if (res) return res;
       }
     }
@@ -1064,11 +1224,15 @@ class VisualizerApp {
     if (this.nodeIdBadge) this.nodeIdBadge.textContent = node.id || "—";
     if (this.terminalBadge) this.terminalBadge.hidden = !node.is_terminal;
 
+    const trace = node.llm_trace || null;
+    const isFallback = !!(trace && trace.source === "fallback");
+
     // 1. Thought & Action Card
     if (this.thoughtModeTag) {
       this.thoughtModeTag.classList.remove("live");
-      if (node.thought) this.thoughtModeTag.textContent = "Hybrid Thought";
-      else if (node.action) this.thoughtModeTag.textContent = "Paper Action";
+      if (isFallback) this.thoughtModeTag.textContent = "Fallback Action";
+      else if (node.thought) this.thoughtModeTag.textContent = "Hybrid Thought";
+      else if (node.action) this.thoughtModeTag.textContent = "Action";
       else this.thoughtModeTag.textContent = "Root";
     }
 
@@ -1079,15 +1243,177 @@ class VisualizerApp {
           ${node.action ? `<div class="action-line"><span>Action</span><span class="action-pill">${this.escapeHtml(node.action)}</span></div>` : ""}
         `;
       } else if (node.action) {
+        const hint = isFallback
+          ? "No reasoning recorded: the model output was unusable, so the agent enumerated legal actions instead (see Model Input / Output)."
+          : "No reasoning recorded for this action (Paper mode or run saved before trace capture).";
         this.thoughtDisplay.innerHTML = `
           <div class="action-line"><span>Action</span><span class="action-pill">${this.escapeHtml(node.action)}</span></div>
-          <p class="empty-hint">Natural-language Paper mode transition (no structured thought recorded).</p>
+          <p class="empty-hint">${hint}</p>
         `;
       } else {
         this.thoughtDisplay.innerHTML = `
           <p class="empty-hint">Initial starting state. Use <strong>Step</strong> or <strong>Play</strong> to expand the reasoning tree.</p>
         `;
       }
+    }
+
+    // 1b. Model Input / Output Card
+    if (this.traceSourceBadge) {
+      this.traceSourceBadge.hidden = !trace;
+      this.traceSourceBadge.classList.toggle("danger", isFallback);
+      if (trace) {
+        const sourceLabels = {
+          model: "model call",
+          fallback: "fallback",
+          "model-paper": "paper call",
+        };
+        this.traceSourceBadge.textContent = sourceLabels[trace.source] || trace.source || "trace";
+      }
+    }
+
+    if (this.modelIo) {
+      if (!trace) {
+        this.modelIo.innerHTML = `<p class="empty-hint">${
+          node.action
+            ? "No model trace saved for this node (run created before trace capture was enabled)."
+            : "Root node: no model call was made."
+        }</p>`;
+      } else {
+        const reason = trace.reason
+          ? `<p class="trace-warning">${this.escapeHtml(trace.reason)}</p>`
+          : "";
+        const modelMeta = trace.model ? `<span>model: ${this.escapeHtml(trace.model)}</span>` : "";
+        const logprobMeta =
+          trace.logprob !== undefined
+            ? `<span>logprob: ${Number(trace.logprob).toFixed(3)}</span>`
+            : "";
+        const probMeta =
+          trace.prob !== undefined
+            ? `<span>r1: ${Number(trace.prob).toFixed(3)}</span>`
+            : "";
+        const isPaper = trace.source === "model-paper" || trace.source === "rollout";
+        const outputTitle = isPaper ? "Scored action · r1" : "Model output · raw";
+        const outputText = isPaper
+          ? trace.source === "rollout"
+            ? "(rollout: action likelihood skipped, only the goal heuristic r2 is used)"
+            : `log P(action | state, goal) = ${Number(trace.logprob ?? 0).toFixed(3)}\n` +
+              `normalized r1 = ${Number(trace.prob ?? 0).toFixed(3)}\n\n` +
+              "Paper mode enumerates every legal action and ranks it; it does not generate a single plan line."
+          : trace.response || "(empty)";
+        const proposed = trace.proposed
+          ? `<details class="io-block"><summary>Parsed proposal</summary><pre class="io-pre">${this.escapeHtml(
+              JSON.stringify(trace.proposed, null, 2)
+            )}</pre></details>`
+          : "";
+        this.modelIo.innerHTML = `
+          ${reason}
+          <div class="trace-meta">
+            <span>source: ${this.escapeHtml(trace.source || "model")}</span>
+            ${modelMeta}
+            ${logprobMeta}
+            ${probMeta}
+          </div>
+          <details class="io-block" open>
+            <summary>${outputTitle}</summary>
+            <pre class="io-pre">${this.escapeHtml(outputText)}</pre>
+          </details>
+          <details class="io-block">
+            <summary>Model input · prompt</summary>
+            <pre class="io-pre">${this.escapeHtml(trace.prompt || "(not recorded)")}</pre>
+          </details>
+          ${proposed}
+        `;
+      }
+    }
+
+    // 1c. All LLM calls made while expanding this node, plus the whole path
+    const llmCalls = Array.isArray(node.llm_calls) ? node.llm_calls : [];
+    const pathNodes = this.treeData ? this.findNodePath(this.treeData, node.id) || [] : [];
+    const pathGroups = [];
+    pathNodes.forEach((pathNode) => {
+      const calls = Array.isArray(pathNode.llm_calls) ? pathNode.llm_calls : [];
+      if (calls.length) {
+        pathGroups.push({
+          depth: pathNode.depth,
+          action: pathNode.action,
+          calls,
+        });
+      }
+    });
+    const pathCallCount = pathGroups.reduce((total, group) => total + group.calls.length, 0);
+
+    const renderCall = (call, idx, openDefault = false) => {
+      const phase =
+        call.phase === "world-model"
+          ? "world model"
+          : call.phase === "action-scoring"
+            ? "action scoring"
+            : "model call";
+      const actionLabel = call.action ? ` · ${call.action}` : "";
+      const meta = [];
+      if (call.logprob !== undefined && call.logprob !== null) {
+        meta.push(`logprob ${Number(call.logprob).toFixed(3)}`);
+      }
+      if (call.prob !== undefined && call.prob !== null) {
+        meta.push(`r1 ${Number(call.prob).toFixed(3)}`);
+      }
+      if (call.source) meta.push(`source ${call.source}`);
+      if (call.error) meta.push("error");
+      const metaHtml = meta.length
+        ? `<div class="trace-meta">${meta
+            .map((m) => `<span>${this.escapeHtml(m)}</span>`)
+            .join("")}</div>`
+        : "";
+      const errorHtml = call.error
+        ? `<p class="trace-warning">${this.escapeHtml(call.error)}</p>`
+        : "";
+      const responseLabel = call.phase === "action-scoring" ? "Scored continuation" : "Response";
+      return `<details class="io-block call-block${call.error ? " call-error" : ""}" ${openDefault ? "open" : ""}>
+        <summary>#${idx + 1} ${this.escapeHtml(phase)}${this.escapeHtml(actionLabel)}</summary>
+        ${metaHtml}
+        ${errorHtml}
+        <div class="live-section-label">Prompt</div>
+        <pre class="io-pre">${this.escapeHtml(call.prompt || "(not recorded)")}</pre>
+        <div class="live-section-label">${responseLabel}</div>
+        <pre class="io-pre">${this.escapeHtml(call.response || "(not recorded)")}</pre>
+      </details>`;
+    };
+
+    if (this.llmCallsBadge) {
+      this.llmCallsBadge.hidden = pathCallCount === 0;
+      if (pathCallCount) {
+        this.llmCallsBadge.textContent = `${pathCallCount} call${pathCallCount === 1 ? "" : "s"}`;
+      }
+    }
+
+    if (this.llmCalls) {
+      const stepHtml = llmCalls.length
+        ? llmCalls.map((call, idx) => renderCall(call, idx, idx === 0)).join("")
+        : `<p class="empty-hint">${
+            node.action
+              ? "No calls were made while expanding this node (leaf, terminal, or run saved before call capture)."
+              : "Root node: no calls were made while expanding it."
+          }</p>`;
+
+      const pathHtml = pathGroups.length
+        ? `<details class="io-block path-calls"${llmCalls.length ? "" : " open"}>
+            <summary>Whole path · ${pathCallCount} call${pathCallCount === 1 ? "" : "s"} across ${pathGroups.length} step${pathGroups.length === 1 ? "" : "s"}</summary>
+            ${pathGroups
+              .map(
+                (group) => `<div class="path-call-group">
+                  <div class="live-section-label">Depth ${group.depth}${group.action ? ` · after ${this.escapeHtml(this.formatShortAction(group))}` : ""}</div>
+                  ${group.calls.map((call, idx) => renderCall(call, idx)).join("")}
+                </div>`
+              )
+              .join("")}
+          </details>`
+        : "";
+
+      this.llmCalls.innerHTML = `
+        <div class="live-section-label">This step · ${llmCalls.length} call${llmCalls.length === 1 ? "" : "s"}</div>
+        ${stepHtml}
+        ${pathHtml}
+      `;
     }
 
     // 2. Metrics Overview + Raw JSON
@@ -1120,6 +1446,9 @@ class VisualizerApp {
         {
           id: node.id,
           action: node.action,
+          thought: node.thought,
+          llm_trace: node.llm_trace,
+          llm_calls: node.llm_calls,
           visits: node.visits,
           Q: node.Q,
           M: node.M,
@@ -1261,6 +1590,230 @@ class VisualizerApp {
         stackEl.appendChild(blockEl);
       });
       this.stacksArea.appendChild(stackEl);
+    });
+  }
+
+  /* ========================================================================
+     Resizable Layout (draggable splitters)
+     ======================================================================== */
+
+  layoutStorageKey() {
+    return "rap.layout.v1";
+  }
+
+  loadLayout() {
+    try {
+      const raw = localStorage.getItem(this.layoutStorageKey());
+      return raw ? JSON.parse(raw) || {} : {};
+    } catch {
+      return {};
+    }
+  }
+
+  saveLayout(patch) {
+    this.layoutState = { ...(this.layoutState || {}), ...patch };
+    try {
+      localStorage.setItem(this.layoutStorageKey(), JSON.stringify(this.layoutState));
+    } catch {
+      /* localStorage can be unavailable (private mode); layout still works in memory */
+    }
+  }
+
+  applyLayout() {
+    const layout = this.layoutState || {};
+    const workspace = document.querySelector(".workspace");
+    if (workspace && Number.isFinite(layout.splitTop)) {
+      workspace.style.setProperty("--split-top", `${layout.splitTop}%`);
+    }
+
+    const applyGrows = (selector, values) => {
+      const items = Array.from(document.querySelectorAll(selector));
+      if (!Array.isArray(values) || values.length !== items.length) return;
+      items.forEach((el, index) => {
+        const value = Number(values[index]);
+        if (Number.isFinite(value) && value > 0) el.style.flexGrow = String(value);
+      });
+    };
+
+    applyGrows(".workspace-top > .tree-panel, .workspace-top > .tabletop-panel", layout.topGrows);
+    applyGrows(".inspector-content > .inspector-card", layout.cardGrows);
+  }
+
+  initResizableLayout() {
+    this.layoutState = this.loadLayout();
+    this.applyLayout();
+
+    const topItems = [
+      document.querySelector(".workspace-top > .tree-panel"),
+      document.querySelector(".workspace-top > .tabletop-panel"),
+    ];
+    this.setupColumnSplitter(
+      document.getElementById("splitter-tree-tabletop"),
+      topItems,
+      0,
+      "topGrows",
+      [240, 240]
+    );
+
+    const cards = Array.from(document.querySelectorAll(".inspector-content > .inspector-card"));
+    Array.from(document.querySelectorAll("[data-card-splitter]")).forEach((splitter, index) => {
+      this.setupColumnSplitter(splitter, cards, index, "cardGrows", [150, 150]);
+    });
+
+    this.setupRowSplitter(
+      document.getElementById("splitter-top-inspector"),
+      document.querySelector(".workspace"),
+      document.querySelector(".workspace-top"),
+      document.querySelector(".inspector-panel")
+    );
+  }
+
+  scheduleTreeFit() {
+    if (this.treeFitFrame) cancelAnimationFrame(this.treeFitFrame);
+    this.treeFitFrame = requestAnimationFrame(() => {
+      this.treeFitFrame = null;
+      if (!this.treeData || this.hasManualViewport) return;
+      this.fitTreeToView();
+    });
+  }
+
+  setupColumnSplitter(splitter, items, index, groupKey, mins) {
+    if (!splitter || !Array.isArray(items) || index >= items.length - 1) return;
+    const prev = items[index];
+    const next = items[index + 1];
+    if (!prev || !next) return;
+
+    const [minPrev, minNext] = mins || [140, 140];
+
+    // Convert every sibling's flex-grow to its current pixel width, so the
+    // ratios stay proportional when only two of them are dragged.
+    const normalize = () => {
+      const widths = items.map((el) => Math.max(1, el.getBoundingClientRect().width));
+      items.forEach((el, i) => {
+        el.style.flexGrow = String(widths[i]);
+        el.style.flexShrink = "1";
+      });
+      return widths;
+    };
+
+    const persist = () => {
+      this.saveLayout({
+        [groupKey]: items.map((el) => Number(el.style.flexGrow) || 1),
+      });
+    };
+
+    const applyPair = (widths, dx) => {
+      const total = widths[index] + widths[index + 1];
+      const newPrev = Math.min(total - minNext, Math.max(minPrev, widths[index] + dx));
+      prev.style.flexGrow = String(newPrev);
+      next.style.flexGrow = String(total - newPrev);
+      return newPrev - widths[index];
+    };
+
+    let drag = null;
+    splitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      splitter.setPointerCapture?.(event.pointerId);
+      drag = { startX: event.clientX, widths: normalize() };
+      document.body.classList.add("is-resizing", "is-resizing-col");
+    });
+
+    splitter.addEventListener("pointermove", (event) => {
+      if (!drag) return;
+      applyPair(drag.widths, event.clientX - drag.startX);
+    });
+
+    const finish = () => {
+      if (!drag) return;
+      drag = null;
+      document.body.classList.remove("is-resizing", "is-resizing-col");
+      persist();
+      this.scheduleTreeFit();
+    };
+    splitter.addEventListener("pointerup", finish);
+    splitter.addEventListener("pointercancel", finish);
+
+    splitter.addEventListener("dblclick", () => {
+      items.forEach((el) => {
+        el.style.flexGrow = "";
+        el.style.flexShrink = "";
+      });
+      this.saveLayout({ [groupKey]: null });
+      this.scheduleTreeFit();
+    });
+
+    splitter.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const widths = normalize();
+      applyPair(widths, event.key === "ArrowLeft" ? -16 : 16);
+      persist();
+      this.scheduleTreeFit();
+    });
+  }
+
+  setupRowSplitter(splitter, workspace, top, inspector) {
+    if (!splitter || !workspace || !top || !inspector) return;
+    const MIN_TOP = 220;
+    const MIN_BOTTOM = 150;
+
+    const apply = (clientY, offset) => {
+      const topRect = top.getBoundingClientRect();
+      const inspectorRect = inspector.getBoundingClientRect();
+      const splitterRect = splitter.getBoundingClientRect();
+      const total = topRect.height + inspectorRect.height + splitterRect.height;
+      if (total <= 0) return null;
+      const desired = clientY - offset - topRect.top;
+      const newTop = Math.min(total - MIN_BOTTOM, Math.max(MIN_TOP, desired));
+      const pct = (newTop / total) * 100;
+      workspace.style.setProperty("--split-top", `${pct.toFixed(3)}%`);
+      return pct;
+    };
+
+    let drag = null;
+    splitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      splitter.setPointerCapture?.(event.pointerId);
+      const rect = splitter.getBoundingClientRect();
+      drag = { offset: event.clientY - rect.top };
+      document.body.classList.add("is-resizing", "is-resizing-row");
+    });
+
+    splitter.addEventListener("pointermove", (event) => {
+      if (!drag) return;
+      apply(event.clientY, drag.offset);
+    });
+
+    const persist = () => {
+      const raw = workspace.style.getPropertyValue("--split-top").replace("%", "").trim();
+      const pct = Number(raw);
+      this.saveLayout({ splitTop: Number.isFinite(pct) ? pct : null });
+      this.scheduleTreeFit();
+    };
+
+    const finish = () => {
+      if (!drag) return;
+      drag = null;
+      document.body.classList.remove("is-resizing", "is-resizing-row");
+      persist();
+    };
+    splitter.addEventListener("pointerup", finish);
+    splitter.addEventListener("pointercancel", finish);
+
+    splitter.addEventListener("dblclick", () => {
+      workspace.style.removeProperty("--split-top");
+      this.saveLayout({ splitTop: null });
+      this.scheduleTreeFit();
+    });
+
+    splitter.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      const rect = splitter.getBoundingClientRect();
+      apply(rect.top + rect.height / 2 + (event.key === "ArrowUp" ? -16 : 16), rect.height / 2);
+      persist();
     });
   }
 

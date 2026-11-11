@@ -315,6 +315,57 @@ class TestDeserializeTree:
         assert isinstance(c2.state, BlockState)
         assert c2.state.holding == "orange"
 
+    def test_deserialize_tree_preserves_llm_trace(self) -> None:
+        """deserialize_tree restores the per-node model prompt/output trace."""
+        trace = {
+            "source": "model",
+            "goal": "the red block is on top of the blue block",
+            "model": "ollama/gpt-oss:20b",
+            "prompt": "Goal: ...\n\nCurrent State: ...",
+            "response": '{"action": "pick_up", "block": "red"}',
+            "proposed": {"action": "pick_up", "block": "red"},
+            "reason": None,
+        }
+        node = MCTSNode(
+            state=BlockState(clear={"red"}, on_table={"red"}, on={}, holding=None),
+            depth=0,
+            llm_trace=trace,
+        )
+
+        restored = deserialize_tree(serialize_tree(node))
+
+        assert restored.llm_trace == trace
+
+    def test_deserialize_tree_preserves_llm_calls(self) -> None:
+        """deserialize_tree restores the full per-step call log used by the inspector."""
+        calls = [
+            {
+                "phase": "action-scoring",
+                "action": "Pick up the red block.",
+                "prompt": "P",
+                "response": "pick up the red block",
+                "logprob": -1.0,
+                "prob": 0.5,
+                "error": None,
+            },
+            {
+                "phase": "world-model",
+                "action": "Pick up the red block.",
+                "prompt": "W",
+                "response": "[CHANGE] ...",
+                "error": None,
+            },
+        ]
+        node = MCTSNode(
+            state=BlockState(clear={"red"}, on_table={"red"}, on={}, holding=None),
+            depth=0,
+            llm_calls=calls,
+        )
+
+        restored = deserialize_tree(serialize_tree(node))
+
+        assert restored.llm_calls == calls
+
     def test_deserialized_tree_works_with_trajectory_extraction_and_console(self) -> None:
         """Restored tree works seamlessly with extract_best_trajectory, MCTS, and RichMCTSConsole."""
         orig_root, _ = _build_sample_tree()

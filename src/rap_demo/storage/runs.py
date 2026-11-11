@@ -81,6 +81,7 @@ def _serialize_trajectory_steps(best_path: list[MCTSNode]) -> list[dict[str, Any
                 "depth": int(node.depth),
                 "action": str(node.action) if node.action is not None else None,
                 "thought": thought,
+                "llm_trace": getattr(node, "llm_trace", None),
                 "reward": float(node.reward),
                 "visits": int(node.N),
                 "Q": q_val,
@@ -152,6 +153,8 @@ def deserialize_tree(tree_data: dict[str, Any], parent: MCTSNode | None = None) 
         reward=float(tree_data.get("reward", 0.0)),
         is_terminal=bool(tree_data.get("is_terminal", False)),
         thought=tree_data.get("thought"),
+        llm_trace=tree_data.get("llm_trace"),
+        llm_calls=tree_data.get("llm_calls"),
     )
     node.N = int(tree_data.get("visits", 0))
     node.Q = float(tree_data.get("Q", 0.0))

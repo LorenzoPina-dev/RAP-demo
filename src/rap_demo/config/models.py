@@ -57,6 +57,7 @@ class ModelProfile:
     timeout: float | None = None
     mode: str | None = None
     iterations: int | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.alias, str) or not self.alias.strip():
@@ -178,6 +179,7 @@ def load_models_config(config_path: str | Path | None = None) -> ModelsConfig:
             timeout=entry.get("timeout"),
             mode=entry.get("mode"),
             iterations=entry.get("iterations"),
+            reasoning_effort=entry.get("reasoning_effort"),
         )
 
     return ModelsConfig(

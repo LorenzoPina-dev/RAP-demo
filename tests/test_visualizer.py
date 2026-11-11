@@ -49,7 +49,11 @@ from rap_demo.visualizer.serializer import (
     serialize_blocksworld_state,
 )
 from rap_demo.visualizer.console import RichMCTSConsole
-from rap_demo.visualizer.web.controller import SearchController, SearchStatus
+from rap_demo.visualizer.web.controller import (
+    SearchController,
+    SearchStatus,
+    _build_tree_with_sim_preview,
+)
 from rap_demo.visualizer.web.app import create_app, app
 
 
@@ -278,6 +282,58 @@ class TestTreeSerializerContract:
             assert len(curr_dict["children"]) == 1
             curr_dict = curr_dict["children"][0]
         assert curr_dict["reward"] == float(depth)
+
+    def test_serialize_tree_includes_llm_trace(self) -> None:
+        """Serialized nodes expose the model prompt/output trace for the inspector UI."""
+        trace = {
+            "source": "fallback",
+            "prompt": "Goal: red on blue",
+            "response": "not json",
+            "reason": "Model output did not contain a JSON object.",
+        }
+        node = MCTSNode(state="S0", depth=0, llm_trace=trace)
+
+        payload = serialize_tree(node)
+
+        assert payload["llm_trace"] == trace
+
+    def test_serialize_tree_includes_llm_calls(self) -> None:
+        """Serialized nodes expose the full per-step call log for the inspector."""
+        calls = [
+            {
+                "phase": "action-scoring",
+                "action": "Pick up the red block.",
+                "prompt": "P",
+                "response": "pick up the red block",
+                "logprob": -1.0,
+                "prob": 0.5,
+                "error": None,
+            }
+        ]
+        node = MCTSNode(state="S0", depth=0, llm_calls=calls)
+
+        payload = serialize_tree(node)
+
+        assert payload["llm_calls"] == calls
+
+    def test_sim_preview_nodes_expose_llm_trace(self) -> None:
+        """Rollout preview nodes carry their trace so the inspector can explain them."""
+        trace = {"source": "rollout", "prompt": None, "response": None}
+        root = MCTSNode(state="S0", depth=0)
+        sim_child = MCTSNode(
+            state="S1",
+            action="go_to_s1",
+            parent=root,
+            depth=1,
+            reward=1.0,
+            llm_trace=trace,
+        )
+
+        tree = _build_tree_with_sim_preview(root, root, [root, sim_child])
+
+        preview = tree["children"][0]
+        assert preview["is_preview"] is True
+        assert preview["llm_trace"] == trace
 
 
 class TestBlocksworldStateSerializer:
@@ -850,4 +906,172 @@ class TestVisualizerWebApp:
             response = await client.post("/api/search/step")
             assert response.status_code == 502
             assert "Malformed LLM response" in response.json()["detail"]
+
+
+# ============================================================================
+# 4. Problem Editor Tests (initial state / goal replacement)
+# ============================================================================
+
+
+class TestProblemEditor:
+    """Tests for `POST /api/problem` and `SearchController.set_problem`."""
+
+    @pytest.fixture
+    def controller(self) -> SearchController:
+        world = SimpleMockWorld()
+        mcts = MCTS(world_model=world, reasoning_agent=world, max_depth=5)
+        return SearchController(
+            mcts=mcts,
+            initial_state="S0",
+            max_iterations=10,
+            step_delay=0.01,
+            goal=["the red block is on top of the blue block"],
+        )
+
+    @pytest.fixture
+    async def async_client(self, controller: SearchController) -> AsyncGenerator[httpx.AsyncClient, None]:
+        transport = ASGITransport(app=create_app(controller=controller))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+
+    @pytest.mark.asyncio
+    async def test_post_problem_updates_goal_state_and_resets_tree(
+        self, async_client: httpx.AsyncClient, controller: SearchController
+    ) -> None:
+        """POST /api/problem replaces the problem, resets iteration, and returns the new state."""
+        await controller.step()
+        assert controller.iteration == 1
+
+        payload = {
+            "initial_state": json.dumps(
+                {
+                    "clear": ["red", "blue"],
+                    "on_table": ["red", "blue"],
+                    "on": {},
+                    "holding": None,
+                }
+            ),
+            "goal": [
+                "the red block is on top of the blue block",
+                "the blue block is on top of the red block",
+            ],
+        }
+        response = await async_client.post("/api/problem", json=payload)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["iteration"] == 0
+        assert data["status"] in ("idle", SearchStatus.IDLE)
+        assert data["goal"] == payload["goal"]
+        assert data["state"]["stacks"] == [["blue"], ["red"]] or data["state"]["stacks"] == [
+            ["red"],
+            ["blue"],
+        ]
+        assert data["tree"]["state"] == data["state"]
+        assert controller.iteration == 0
+        assert isinstance(controller.initial_state, BlockState)
+        assert controller.goal == payload["goal"]
+
+    @pytest.mark.asyncio
+    async def test_post_problem_accepts_canonical_text_state(
+        self, async_client: httpx.AsyncClient
+    ) -> None:
+        """POST /api/problem also accepts the canonical English state description."""
+        response = await async_client.post(
+            "/api/problem",
+            json={
+                "initial_state": "the red block is on the table, the hand is empty",
+                "goal": ["the red block is on top of the blue block"],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["state"]["stacks"] == [["red"]]
+        assert data["state"]["holding"] is None
+
+    @pytest.mark.asyncio
+    async def test_post_problem_rejects_inconsistent_state(
+        self, async_client: httpx.AsyncClient, controller: SearchController
+    ) -> None:
+        """POST /api/problem returns 400 when the state is physically impossible."""
+        response = await async_client.post(
+            "/api/problem",
+            json={
+                "initial_state": json.dumps(
+                    {
+                        "clear": ["red"],
+                        "on_table": ["red", "blue"],
+                        "on": {"red": "blue"},
+                        "holding": None,
+                    }
+                ),
+                "goal": ["the red block is on top of the blue block"],
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Invalid initial state" in response.json()["detail"]
+        assert controller.iteration == 0
+        assert controller.initial_state == "S0"
+
+    @pytest.mark.asyncio
+    async def test_post_problem_rejects_empty_goal(self, async_client: httpx.AsyncClient) -> None:
+        """POST /api/problem rejects a payload without goal conditions."""
+        response = await async_client.post(
+            "/api/problem",
+            json={"initial_state": "the red block is on the table, the hand is empty", "goal": []},
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_problem_resets_status_and_iteration(self, controller: SearchController) -> None:
+        """`set_problem` stops a running search and rebuilds the root with the new state."""
+        await controller.start()
+        await asyncio.sleep(0.05)
+        assert controller.iteration > 0
+
+        new_state = BlockState(
+            clear={"red"},
+            on_table={"blue"},
+            on={"red": "blue"},
+            holding=None,
+        )
+        result = await controller.set_problem(new_state, ["the red block is on top of the blue block"])
+
+        assert controller.status == SearchStatus.IDLE
+        assert controller.iteration == 0
+        assert result["iteration"] == 0
+        assert controller.initial_state is new_state
+        assert controller.root.state is new_state
+        assert controller.goal == ["the red block is on top of the blue block"]
+
+    @pytest.mark.asyncio
+    async def test_set_problem_propagates_goal_to_agent_and_world_model(self) -> None:
+        """`set_problem` must update the Blocksworld agent prompt goal and reward goal."""
+        from rap_demo.domains.blocksworld.agent import BlocksworldAgent
+        from rap_demo.domains.blocksworld.world_model import BlocksworldWorldModel
+        from rap_demo.llm.mock import MockLLM
+
+        llm = MockLLM(default_response="")
+        agent = BlocksworldAgent(llm=llm, goal="the red block is on top of the blue block")
+        world_model = BlocksworldWorldModel(goal=["the red block is on top of the blue block"], llm=llm)
+        mcts = MCTS(world_model=world_model, reasoning_agent=agent, max_depth=3)
+        controller = SearchController(mcts=mcts, initial_state="S0", max_iterations=5)
+
+        goal = [
+            "the orange block is on top of the red block",
+            "the red block is on top of the blue block",
+        ]
+        await controller.set_problem(
+            BlockState(clear={"orange"}, on_table={"red", "blue"}, on={}, holding=None),
+            goal,
+        )
+
+        assert agent.goal == (
+            "the orange block is on top of the red block "
+            "and the red block is on top of the blue block"
+        )
+        assert world_model.goal == goal
 

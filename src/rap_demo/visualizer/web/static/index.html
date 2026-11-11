@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RAP Visualizer — Reasoning via Planning</title>
-  <link rel="stylesheet" href="/static/style.css?v=9">
+  <link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body>
   <header class="topbar">
@@ -67,6 +67,7 @@
   </header>
 
   <main class="workspace">
+    <div class="workspace-top">
     <!-- MCTS Reasoning Tree Panel -->
     <section class="panel tree-panel">
       <div class="panel-header">
@@ -102,6 +103,10 @@
       </div>
     </section>
 
+    <div id="splitter-tree-tabletop" class="grid-splitter grid-splitter-col" role="separator"
+      aria-orientation="vertical" aria-label="Resize reasoning tree and domain state panels" tabindex="0"
+      title="Drag to resize · double-click to reset"></div>
+
     <!-- Blocksworld Tabletop Simulator Panel -->
     <section class="panel tabletop-panel">
       <div class="panel-header">
@@ -109,7 +114,13 @@
           <span class="panel-title">Domain State</span>
           <span class="panel-meta">Blocksworld</span>
         </div>
-        <span id="holding-pill" class="subtle-pill">Hand: empty</span>
+        <div class="panel-actions">
+          <span id="holding-pill" class="subtle-pill">Hand: empty</span>
+          <button id="btn-edit-problem" class="btn btn-sm" type="button" title="Edit initial state and goal">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+            <span>Edit problem</span>
+          </button>
+        </div>
       </div>
 
       <div id="goal-strip" class="goal-strip" hidden>
@@ -131,6 +142,11 @@
         <div class="table-surface"></div>
       </div>
     </section>
+    </div>
+
+    <div id="splitter-top-inspector" class="grid-splitter grid-splitter-row" role="separator"
+      aria-orientation="horizontal" aria-label="Resize workspace and node inspector panels" tabindex="0"
+      title="Drag to resize · double-click to reset"></div>
 
     <!-- Thought & Node Inspector Panel -->
     <section class="panel inspector-panel">
@@ -159,7 +175,36 @@
           </div>
         </div>
 
-        <div class="inspector-card">
+        <div class="grid-splitter grid-splitter-col card-splitter" data-card-splitter role="separator"
+          aria-orientation="vertical" aria-label="Resize reasoning card" tabindex="0" title="Drag to resize · double-click to reset"></div>
+
+        <div class="inspector-card model-io-card">
+          <div class="card-header-row">
+            <h4>Model Input / Output</h4>
+            <span id="trace-source-badge" class="subtle-pill" hidden>model</span>
+          </div>
+          <div id="model-io" class="model-io">
+            <p class="empty-hint">Select a node to see the exact prompt sent to the model and its raw response.</p>
+          </div>
+        </div>
+
+        <div class="grid-splitter grid-splitter-col card-splitter" data-card-splitter role="separator"
+          aria-orientation="vertical" aria-label="Resize model I/O card" tabindex="0" title="Drag to resize · double-click to reset"></div>
+
+        <div class="inspector-card llm-calls-card">
+          <div class="card-header-row">
+            <h4>LLM Calls</h4>
+            <span id="llm-calls-badge" class="subtle-pill" hidden>0 calls</span>
+          </div>
+          <div id="llm-calls" class="model-io">
+            <p class="empty-hint">Select a node to list every prompt/response produced while expanding it.</p>
+          </div>
+        </div>
+
+        <div class="grid-splitter grid-splitter-col card-splitter" data-card-splitter role="separator"
+          aria-orientation="vertical" aria-label="Resize LLM calls card" tabindex="0" title="Drag to resize · double-click to reset"></div>
+
+        <div class="inspector-card metrics-card">
           <div class="card-header-row">
             <h4>MCTS Metrics</h4>
             <span id="node-id-badge" class="mono-muted">—</span>
@@ -168,7 +213,10 @@
           <pre id="node-inspector" class="json-view" hidden></pre>
         </div>
 
-        <div class="inspector-card">
+        <div class="grid-splitter grid-splitter-col card-splitter" data-card-splitter role="separator"
+          aria-orientation="vertical" aria-label="Resize MCTS metrics card" tabindex="0" title="Drag to resize · double-click to reset"></div>
+
+        <div class="inspector-card state-card">
           <div class="card-header-row">
             <h4>Physical State</h4>
             <span id="terminal-badge" class="subtle-pill" hidden>Terminal</span>
@@ -180,8 +228,40 @@
     </section>
   </main>
 
+  <dialog id="problem-dialog" class="problem-dialog" aria-labelledby="problem-dialog-title">
+    <form id="problem-form" class="problem-form">
+      <div class="dialog-header">
+        <h2 id="problem-dialog-title">Problem definition</h2>
+        <button id="btn-problem-close" class="btn btn-icon" type="button" aria-label="Close problem editor" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"></line><line x1="18" y1="6" x2="6" y2="18"></line></svg>
+        </button>
+      </div>
+
+      <p class="dialog-hint">Applying a new problem resets the reasoning tree. The model still comes from the terminal command.</p>
+
+      <label class="field" for="problem-goal">
+        <span class="field-label">Goal conditions · one per line</span>
+        <textarea id="problem-goal" class="problem-input" rows="3" spellcheck="false"
+          placeholder="the red block is on top of the blue block"></textarea>
+      </label>
+
+      <label class="field" for="problem-state">
+        <span class="field-label">Initial state · JSON or canonical English</span>
+        <textarea id="problem-state" class="problem-input" rows="5" spellcheck="false"
+          placeholder='{"clear": ["red"], "on_table": ["blue"], "on": {"red": "blue"}, "holding": null}'></textarea>
+      </label>
+
+      <p id="problem-error" class="dialog-error" role="alert" hidden></p>
+
+      <div class="dialog-actions">
+        <button id="btn-problem-cancel" class="btn" type="button">Cancel</button>
+        <button id="btn-problem-apply" class="btn btn-primary" type="submit">Apply &amp; reset</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=15"></script>
 </body>
 </html>

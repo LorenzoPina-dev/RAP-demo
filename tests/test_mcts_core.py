@@ -471,8 +471,20 @@ class TestMCTSBackpropagation:
         # Second backpropagation
         mcts.backpropagate([node], rollout_reward=0.0)
         assert node.N == 2
-        assert node.Q == 10.0  # Sum of rewards
+        assert node.Q == 5.0  # Mean of the two returns (5.0 and 5.0)
         assert node.M == 5.0
+
+    def test_backpropagate_q_is_running_mean(self) -> None:
+        """Q averages returns across visits (Eq. 1/2), it is not a running sum."""
+        mcts = MCTS(discount=1.0, aggr_reward="sum")
+        node = MCTSNode(state="root", reward=5.0)
+
+        mcts.backpropagate([node], rollout_reward=0.0)  # return 5.0
+        mcts.backpropagate([node], rollout_reward=5.0)  # return 10.0
+
+        assert node.N == 2
+        assert node.Q == pytest.approx(7.5)
+        assert node.M == 10.0
 
     def test_backpropagate_two_step_path_discounted(self) -> None:
         """Backpropagation with discount factor gamma correctly discounts future returns.

@@ -23,7 +23,12 @@ from rap_demo.core.events import EventBus
 from rap_demo.core.mcts import MCTS, extract_best_trajectory
 from rap_demo.core.node import MCTSNode
 from rap_demo.domains.blocksworld.domain import BlocksworldDomain
-from rap_demo.domains.blocksworld.models import BlockState
+from rap_demo.domains.blocksworld.problem import (
+    DEFAULT_GOAL,
+    DEFAULT_INITIAL_STATE,
+    parse_goal as _parse_goal,
+    parse_initial_state as _parse_initial_state,
+)
 from rap_demo.llm.base import BaseLLM, LLMError
 from rap_demo.llm.factory import get_llm
 from rap_demo.llm.litellm_client import _load_dotenv_file
@@ -41,18 +46,6 @@ from rap_demo.visualizer.web.controller import SearchController, SearchStatus
 
 SUPPORTED_DOMAINS: set[str] = {"blocksworld"}
 
-DEFAULT_INITIAL_STATE: BlockState = BlockState(
-    clear={"red", "blue", "orange"},
-    on_table={"yellow", "red", "blue"},
-    on={"orange": "yellow"},
-    holding=None,
-)
-
-DEFAULT_GOAL: list[str] = [
-    "the red block is on top of the blue block",
-    "the orange block is on top of the red block",
-]
-
 
 def _create_llm(
     backend: str,
@@ -62,6 +55,7 @@ def _create_llm(
     rpm: int | None = None,
     timeout: float | None = None,
     config_path: str | Path | None = None,
+    reasoning_effort: str | None = None,
 ) -> BaseLLM:
     """Instantiates and configures LLM backend for planning.
 
@@ -173,6 +167,8 @@ def _create_llm(
             kwargs["requests_per_minute"] = rpm
         if config_path is not None:
             kwargs["config_path"] = config_path
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
     return get_llm(backend, **kwargs)
 
 
@@ -203,6 +199,7 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
     tpm = getattr(args, "tpm", None)
     rpm = getattr(args, "rpm", None)
     timeout: float | None = None
+    reasoning_effort: str | None = None
     explicit_args: set[str] = getattr(args, "_explicit_args", set())
 
     cfg: ModelsConfig | None = None
@@ -225,6 +222,7 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
             if rpm is None:
                 rpm = profile.rpm
             timeout = profile.timeout if profile.timeout is not None else cfg.defaults.get("timeout")
+            reasoning_effort = profile.reasoning_effort
             if "mode" not in explicit_args and profile.mode is not None:
                 args.mode = profile.mode
             if "iterations" not in explicit_args and profile.iterations is not None:
@@ -239,6 +237,8 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
     }
     if timeout is not None:
         resolved["timeout"] = float(timeout)
+    if reasoning_effort is not None:
+        resolved["reasoning_effort"] = reasoning_effort
     if config_path is not None:
         resolved["config_path"] = config_path
     return resolved
@@ -301,6 +301,39 @@ def _print_backend_error_tip(err_console: Console, backend: str) -> None:
         )
 
 
+def _add_problem_arguments(subparser: argparse.ArgumentParser) -> None:
+    """Register Blocksworld problem definition flags on run/ui/compare subparsers."""
+    subparser.add_argument(
+        "--initial-state",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Initial state as JSON ({'clear': [...], 'on_table': [...], 'on': {...}, 'holding': ...}) "
+            "or canonical English (default: built-in demo state)"
+        ),
+    )
+    subparser.add_argument(
+        "--goal",
+        action="append",
+        default=None,
+        metavar="CONDITION",
+        help=(
+            "Goal condition, repeatable or joined with 'and' "
+            "(default: built-in demo goal)"
+        ),
+    )
+    subparser.add_argument(
+        "--max-depth",
+        type=int,
+        default=6,
+        metavar="L",
+        help=(
+            "Depth limit L of the MCTS tree (Algorithm 1; default: 6). "
+            "Must be at least the minimum number of actions needed by the goal."
+        ),
+    )
+
+
 def _add_storage_arguments(subparser: argparse.ArgumentParser) -> None:
     """Register shared run persistence flags on run/ui subparsers."""
     subparser.add_argument(
@@ -345,11 +378,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--mode",
         choices=["hybrid", "paper"],
-        default="hybrid",
+        default="paper",
         action=_TrackExplicitAction,
-        help="Reasoning mode (choices: hybrid, paper; default: hybrid)",
+        help="Reasoning mode (choices: paper, hybrid; default: paper)",
     )
     _add_llm_arguments(run_parser)
+    _add_problem_arguments(run_parser)
     _add_storage_arguments(run_parser)
     run_parser.add_argument(
         "--iterations",
@@ -387,11 +421,12 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument(
         "--mode",
         choices=["hybrid", "paper"],
-        default="hybrid",
+        default="paper",
         action=_TrackExplicitAction,
-        help="Reasoning mode (choices: hybrid, paper; default: hybrid)",
+        help="Reasoning mode (choices: paper, hybrid; default: paper)",
     )
     _add_llm_arguments(ui_parser)
+    _add_problem_arguments(ui_parser)
     _add_storage_arguments(ui_parser)
     ui_parser.add_argument(
         "--iterations",
@@ -409,6 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Domain identifier (default: blocksworld)",
     )
     _add_llm_arguments(compare_parser)
+    _add_problem_arguments(compare_parser)
     compare_parser.add_argument(
         "--iterations",
         type=int,
@@ -521,21 +557,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if args.max_depth <= 0:
+        err_console.print(
+            f"[bold red]Error:[/bold red] Max depth must be positive, got {args.max_depth}."
+        )
+        return 1
+
+    try:
+        initial_state = _parse_initial_state(getattr(args, "initial_state", None))
+        goal = _parse_goal(getattr(args, "goal", None))
+    except ValueError as exc:
+        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        return 1
+
     effective_backend = str(args.backend)
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
         effective_backend = str(resolved_llm_cfg["backend"])
         llm = _create_llm(**resolved_llm_cfg)
         domain = BlocksworldDomain(
-            initial_state=DEFAULT_INITIAL_STATE,
-            goal=DEFAULT_GOAL,
+            initial_state=initial_state,
+            goal=goal,
             llm=llm,
             mode=args.mode,
         )
         mcts = MCTS(
             world_model=domain.create_world_model(),
             reasoning_agent=domain.create_agent(),
-            max_depth=6,
+            max_depth=args.max_depth,
+            aggr_child="mean",
             event_bus=EventBus(),
         )
 
@@ -565,7 +615,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 backend=effective_backend,
                 model=resolved_llm_cfg.get("model") or getattr(llm, "model", None),
                 iterations=args.iterations,
-                goal=DEFAULT_GOAL,
+                goal=goal,
                 command="run",
                 metrics=metrics,
                 best_path=best_path,
@@ -612,21 +662,35 @@ def cmd_ui(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if args.max_depth <= 0:
+        err_console.print(
+            f"[bold red]Error:[/bold red] Max depth must be positive, got {args.max_depth}."
+        )
+        return 1
+
+    try:
+        initial_state = _parse_initial_state(getattr(args, "initial_state", None))
+        goal = _parse_goal(getattr(args, "goal", None))
+    except ValueError as exc:
+        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        return 1
+
     effective_backend = str(args.backend)
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
         effective_backend = str(resolved_llm_cfg["backend"])
         llm = _create_llm(**resolved_llm_cfg)
         domain = BlocksworldDomain(
-            initial_state=DEFAULT_INITIAL_STATE,
-            goal=DEFAULT_GOAL,
+            initial_state=initial_state,
+            goal=goal,
             llm=llm,
             mode=args.mode,
         )
         mcts = MCTS(
             world_model=domain.create_world_model(),
             reasoning_agent=domain.create_agent(),
-            max_depth=6,
+            max_depth=args.max_depth,
+            aggr_child="mean",
             event_bus=EventBus(),
         )
         def _save_ui_run(ctrl: SearchController) -> None:
@@ -646,7 +710,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
                 backend=effective_backend,
                 model=resolved_llm_cfg.get("model") or getattr(llm, "model", None),
                 iterations=ctrl.iteration,
-                goal=DEFAULT_GOAL,
+                goal=ctrl.goal,
                 command="ui",
                 metrics=ui_metrics,
                 best_path=best_traj,
@@ -659,7 +723,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
             mcts=mcts,
             initial_state=domain.get_initial_state(),
             max_iterations=args.iterations,
-            goal=DEFAULT_GOAL,
+            goal=goal,
             mode=args.mode,
             on_finish=on_finish,
             llm=llm,
@@ -706,6 +770,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if args.max_depth <= 0:
+        err_console.print(
+            f"[bold red]Error:[/bold red] Max depth must be positive, got {args.max_depth}."
+        )
+        return 1
+
+    try:
+        initial_state = _parse_initial_state(getattr(args, "initial_state", None))
+        goal = _parse_goal(getattr(args, "goal", None))
+    except ValueError as exc:
+        err_console.print(f"[bold red]Error:[/bold red] {exc}")
+        return 1
+
     effective_backend = str(args.backend)
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
@@ -714,15 +791,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         # 1. Execute Hybrid Mode
         llm_hybrid = _create_llm(**resolved_llm_cfg)
         domain_hybrid = BlocksworldDomain(
-            initial_state=DEFAULT_INITIAL_STATE,
-            goal=DEFAULT_GOAL,
+            initial_state=initial_state,
+            goal=goal,
             llm=llm_hybrid,
             mode="hybrid",
         )
         mcts_hybrid = MCTS(
             world_model=domain_hybrid.create_world_model(),
             reasoning_agent=domain_hybrid.create_agent(),
-            max_depth=6,
+            max_depth=args.max_depth,
+            aggr_child="mean",
         )
         t0_hybrid = time.perf_counter()
         root_hybrid = mcts_hybrid.search(domain_hybrid.get_initial_state(), num_iterations=args.iterations)
@@ -734,15 +812,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         # 2. Execute Paper Mode
         llm_paper = _create_llm(**resolved_llm_cfg)
         domain_paper = BlocksworldDomain(
-            initial_state=DEFAULT_INITIAL_STATE,
-            goal=DEFAULT_GOAL,
+            initial_state=initial_state,
+            goal=goal,
             llm=llm_paper,
             mode="paper",
         )
         mcts_paper = MCTS(
             world_model=domain_paper.create_world_model(),
             reasoning_agent=domain_paper.create_agent(),
-            max_depth=6,
+            max_depth=args.max_depth,
+            aggr_child="mean",
         )
         t0_paper = time.perf_counter()
         root_paper = mcts_paper.search(domain_paper.get_initial_state(), num_iterations=args.iterations)
