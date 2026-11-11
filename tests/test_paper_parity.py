@@ -182,7 +182,7 @@ class TestPaperMCTS:
         assert children[0].is_terminal is True
 
     def test_expand_records_every_llm_call_for_the_step(self) -> None:
-        """The inspector can replay all prompts/responses: N action scores + N world calls."""
+        """The inspector can replay action scoring, world updates, and self-evaluations."""
         llm = MockLLM(
             default_response=(
                 "[CHANGE] the hand was empty and now is holding the red block, "
@@ -199,10 +199,10 @@ class TestPaperMCTS:
         mcts.expand(root)
 
         n_actions = len(INITIAL.get_legal_actions())
-        assert len(root.llm_calls) == 2 * n_actions
+        assert len(root.llm_calls) == 3 * n_actions
         phases = [call["phase"] for call in root.llm_calls]
         assert phases[:n_actions] == ["action-scoring"] * n_actions
-        assert phases[n_actions:] == ["world-model"] * n_actions
+        assert phases[n_actions:] == ["world-model", "self-evaluation"] * n_actions
         assert all(call["prompt"] for call in root.llm_calls)
         assert all(call["response"] for call in root.llm_calls)
         assert all(call["error"] is None for call in root.llm_calls)

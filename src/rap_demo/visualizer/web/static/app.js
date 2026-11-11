@@ -1582,14 +1582,22 @@ class VisualizerApp {
           ? "world model"
           : call.phase === "action-scoring"
             ? "action scoring"
-            : "model call";
+            : call.phase === "self-evaluation"
+              ? "self-evaluation"
+              : "model call";
       const actionLabel = call.action ? ` · ${call.action}` : "";
       const meta = [];
       if (call.logprob !== undefined && call.logprob !== null) {
         meta.push(`logprob ${Number(call.logprob).toFixed(3)}`);
       }
-      if (call.prob !== undefined && call.prob !== null) {
-        meta.push(`r1 ${Number(call.prob).toFixed(3)}`);
+      const r1 = call.r1 ?? call.prob;
+      if (r1 !== undefined && r1 !== null) {
+        meta.push(`r1 ${Number(r1).toFixed(3)}`);
+      }
+      if (call.r2 !== undefined && call.r2 !== null) meta.push(`r2 ${Number(call.r2).toFixed(3)}`);
+      if (call.r3 !== undefined && call.r3 !== null) meta.push(`r3 ${Number(call.r3).toFixed(3)}`);
+      if (call.p_yes !== undefined && call.p_no !== undefined) {
+        meta.push(`P(Yes) ${Number(call.p_yes).toFixed(3)} · P(No) ${Number(call.p_no).toFixed(3)}`);
       }
       if (call.source) meta.push(`source ${call.source}`);
       if (call.error) meta.push("error");

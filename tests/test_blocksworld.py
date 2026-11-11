@@ -46,6 +46,7 @@ from rap_demo.domains.blocksworld.models import (
     HybridActionProposal,
 )
 from rap_demo.domains.blocksworld.rewards import (
+    BlocksworldRewardFunction,
     build_self_eval_prompt,
     calculate_combined_reward,
     calculate_goal_reward,
@@ -703,6 +704,36 @@ class TestBlocksworldRewards:
         )
         assert r_balanced > 0.0
 
+    def test_calculate_combined_reward_averages_r1_r2_r3(self) -> None:
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red")
+
+        reward = calculate_combined_reward(
+            state,
+            action,
+            ["the red block is on top of the blue block"],
+            action_score=0.25,
+            eval_score=0.75,
+        )
+
+        assert math.isclose(reward, (0.25 + 0.0 + 0.75) / 3)
+
+    def test_chained_goal_requires_every_stack_relation(self) -> None:
+        goal = "the green block is on top of the orange block is on top of the blue block"
+        partial_state = BlockState(
+            clear={"green", "blue"},
+            on_table={"orange", "blue"},
+            on={"green": "orange"},
+        )
+        complete_state = BlockState(
+            clear={"green"},
+            on_table={"blue"},
+            on={"green": "orange", "orange": "blue"},
+        )
+
+        assert calculate_goal_reward(partial_state, goal) == 0.5
+        assert calculate_goal_reward(complete_state, goal) == 100.0
+
     def test_build_self_eval_prompt(self, instance_5_state: BlockState) -> None:
         """build_self_eval_prompt must include current state, action, and target goal."""
         action = BlockAction(ActionType.PICK_UP, "red")
@@ -721,6 +752,20 @@ class TestBlocksworldRewards:
         score = score_self_evaluation(mock_llm, prompt)
 
         assert math.isclose(score, 0.85, abs_tol=1e-3)
+
+    def test_reward_function_includes_r3_by_default(self) -> None:
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red")
+        mock_llm = MockLLM(token_probs={"Yes": 0.8, "No": 0.2})
+        reward_fn = BlocksworldRewardFunction(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+        )
+
+        reward = reward_fn(state, action, action_score=0.25)
+
+        assert math.isclose(reward, (0.25 + 0.0 + 0.8) / 3)
+        assert mock_llm.call_count == 1
 
 
 # ============================================================================
@@ -783,6 +828,7 @@ class TestBlocksworldAgent:
         assert trace["response"] == canned_json
         assert trace["proposed"]["action"] == "pick_up"
         assert trace["model"] == getattr(mock_llm, "model", None)
+        assert trace["prob"] == 1.0
 
     def test_agent_hybrid_fallback_trace_explains_rejected_output(
         self, instance_5_state: BlockState
@@ -806,6 +852,7 @@ class TestBlocksworldAgent:
         actions = agent.get_actions(instance_5_state)
 
         assert actions, "Fallback must still expose legal actions"
+        assert math.isclose(sum(action.llm_trace["prob"] for action in actions), 1.0)
         for action in actions:
             assert action.llm_trace is not None
             assert action.llm_trace["source"] == "fallback"
@@ -891,7 +938,66 @@ class TestBlocksworldWorldModel:
         assert next_state.holding == "red"
         assert not is_terminal
         assert isinstance(reward, float)
-        # In hybrid mode, zero LLM calls needed for world transition!
+        # Hybrid transitions remain deterministic; only the R3 token scores use the LLM.
+        assert all(call.method != "generate" for call in mock_llm.calls)
+
+    def test_world_model_combines_r1_r2_r3_and_logs_r3(self) -> None:
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(
+            ActionType.PICK_UP,
+            "red",
+            llm_trace={"prob": 0.25},
+        )
+        mock_llm = MockLLM(token_probs={"Yes": 0.8, "No": 0.2})
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="hybrid",
+        )
+        call_log: list[dict[str, Any]] = []
+
+        next_state, reward, is_terminal = world_model.step(state, action, call_log=call_log)
+
+        assert next_state.holding == "red"
+        assert not is_terminal
+        assert math.isclose(reward, (0.25 + 0.0 + 0.8) / 3)
+        assert call_log[-1]["phase"] == "self-evaluation"
+        assert call_log[-1]["p_yes"] == 0.8
+        assert call_log[-1]["p_no"] == 0.2
+        assert call_log[-1]["response"].startswith("Answer: unavailable")
+        assert call_log[-1]["r3"] == 0.8
+
+    def test_world_model_uses_neutral_r3_when_probabilities_are_missing(self) -> None:
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red", llm_trace={"prob": 0.25})
+        mock_llm = MockLLM(token_probs={"Yes": 0.0, "No": 0.0})
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="hybrid",
+        )
+        call_log: list[dict[str, Any]] = []
+
+        _, reward, _ = world_model.step(state, action, call_log=call_log)
+
+        assert call_log[-1]["r3"] == 0.5
+        assert math.isclose(reward, (0.25 + 0.0 + 0.5) / 3)
+
+    def test_world_model_skips_r3_in_lightweight_rollout(self) -> None:
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        mock_llm = MockLLM(token_probs={"Yes": 0.8, "No": 0.2})
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="hybrid",
+        )
+
+        world_model.step(
+            state,
+            BlockAction(ActionType.PICK_UP, "red"),
+            lightweight=True,
+        )
+
         assert mock_llm.call_count == 0
 
     def test_world_model_paper_mode_uses_llm_for_state_update(
@@ -975,6 +1081,34 @@ class TestBlocksworldWorldModel:
         assert next_state.on == {"red": "blue", "orange": "yellow"}
         assert next_state.clear == {"red", "orange"}
         assert next_state.on_table == {"blue", "yellow"}
+
+    def test_world_model_accepts_concise_stack_change(self) -> None:
+        state = BlockState(
+            clear={"orange"},
+            on_table={"orange"},
+            on={},
+            holding="green",
+        )
+        mock_llm = MockLLM(
+            default_response=(
+                "[CHANGE] the green block is now on top of the orange block, "
+                "and the hand is now empty."
+            )
+        )
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+
+        next_state, _, _ = world_model.step(
+            state,
+            BlockAction(ActionType.STACK, "green", "orange"),
+        )
+
+        assert next_state.on == {"green": "orange"}
+        assert next_state.holding is None
+        assert next_state.clear == {"green"}
 
     def test_world_model_keeps_held_block_out_of_table_and_clear(self) -> None:
         """A held block is neither on the table nor clear, even if the LLM says so."""

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from types import SimpleNamespace
 from typing import Any
 import httpx
 import pytest
@@ -40,6 +41,7 @@ from rap_demo.llm.base import (
 )
 from rap_demo.llm.mock import MockLLM, LLMCall
 from rap_demo.llm.llama_client import LlamaServerClient
+from rap_demo.llm.litellm_client import LiteLLMClient
 from rap_demo.llm.factory import get_llm
 
 
@@ -475,6 +477,10 @@ class TestLlamaServerClient:
                             "logprobs": {
                                 "tokens": [" move", " right"],
                                 "token_logprobs": [-0.15, -0.35],
+                                "text_offset": [
+                                    len("State: at (0, 0)"),
+                                    len("State: at (0, 0)") + 5,
+                                ],
                             },
                         }
                     ],
@@ -532,6 +538,37 @@ class TestLlamaServerClient:
         # "No" probability (with leading space handled): exp(-1.60943791) ≈ 0.20
         prob_no = client.get_token_probability("Is this step correct?", "No")
         assert math.isclose(prob_no, 0.20, rel_tol=1e-3)
+
+    def test_get_token_probabilities_scores_yes_and_no_in_one_request(self) -> None:
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "logprobs": {
+                                "top_logprobs": [
+                                    {" Yes": math.log(0.8), " No": math.log(0.2)}
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+
+        client = LlamaServerClient(
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        probabilities = client.get_token_probabilities("Is this promising?", ["Yes", "No"])
+
+        assert probabilities["Yes"] == pytest.approx(0.8)
+        assert probabilities["No"] == pytest.approx(0.2)
+        assert calls == 1
 
     def test_get_token_probability_token_not_in_top_logprobs(self) -> None:
         """When candidate token is not in top_logprobs distribution, returns 0.0."""
@@ -625,6 +662,95 @@ class TestLlamaServerClient:
             assert client.is_healthy() is True
 
         assert underlying_client.is_closed
+
+
+class TestLiteLLMOllamaLogprobs:
+    """Verify native Ollama continuation scoring and paired self-evaluation probabilities."""
+
+    def test_r1_scores_only_echoed_target_and_r3_uses_one_request(self) -> None:
+        completion_calls: list[dict[str, Any]] = []
+        context = "State: "
+
+        def completion(**kwargs: Any) -> Any:
+            completion_calls.append(kwargs)
+            if "prompt" in kwargs:
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            logprobs=SimpleNamespace(
+                                token_logprobs=[-0.1, -0.2, -0.3],
+                                text_offset=[0, len(context), len(context) + 2],
+                            )
+                        )
+                    ]
+                )
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="Yes"),
+                        logprobs=SimpleNamespace(
+                            content=[
+                                SimpleNamespace(
+                                    top_logprobs=[
+                                        SimpleNamespace(token="Yes", logprob=math.log(0.8)),
+                                        SimpleNamespace(token=" No", logprob=math.log(0.2)),
+                                    ]
+                                )
+                            ]
+                        ),
+                    )
+                ]
+            )
+
+        client = LiteLLMClient(
+            model="ollama/llama3.2",
+            api_base="http://localhost:11434",
+            completion_fn=completion,
+        )
+
+        assert client.get_logprobs(context, "red") == pytest.approx(-0.5)
+        probabilities, answer = client.get_token_probabilities_and_response(
+            "Is it promising?",
+            ["Yes", "No"],
+        )
+
+        assert probabilities == pytest.approx({"Yes": 0.8, "No": 0.2})
+        assert answer == "Yes"
+        assert len(completion_calls) == 2
+        assert completion_calls[0]["model"] == "openai/llama3.2"
+        assert completion_calls[0]["echo"] is True
+        assert completion_calls[0]["max_tokens"] == 0
+        assert completion_calls[1]["top_logprobs"] == 10
+        assert completion_calls[1]["model"] == "openai/llama3.2"
+
+    def test_r3_uses_generated_answer_when_candidate_logprobs_are_missing(self) -> None:
+        client = LiteLLMClient(
+            model="ollama/llama3.2",
+            completion_fn=lambda **_: SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="No, this action does not help."),
+                        logprobs=SimpleNamespace(
+                            content=[
+                                SimpleNamespace(
+                                    top_logprobs=[
+                                        SimpleNamespace(token="Maybe", logprob=-0.1)
+                                    ]
+                                )
+                            ]
+                        ),
+                    )
+                ]
+            ),
+        )
+
+        probabilities, answer = client.get_token_probabilities_and_response(
+            "Is it promising?",
+            ["Yes", "No"],
+        )
+
+        assert probabilities == {"Yes": 0.0, "No": 1.0}
+        assert answer == "No, this action does not help."
 
 
 # ============================================================================

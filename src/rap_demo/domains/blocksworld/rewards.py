@@ -44,22 +44,36 @@ def _is_condition_satisfied(state: BlockState, condition: str) -> bool:
     return False
 
 
+def _split_goal_text(text: str) -> list[str]:
+    """Split conjunctions and expand a compact chain such as A on B on C."""
+    parts = re.split(r",\s*and\s+|\s+and\s+|,", text)
+    conditions: list[str] = []
+    for part in parts:
+        cleaned = part.strip()
+        blocks = re.findall(r"the\s+(\w+)\s+block", cleaned, flags=re.IGNORECASE)
+        if len(blocks) > 2 and cleaned.lower().count("is on top of") == len(blocks) - 1:
+            conditions.extend(
+                f"the {top} block is on top of the {bottom} block"
+                for top, bottom in zip(blocks, blocks[1:])
+            )
+        elif cleaned:
+            conditions.append(cleaned)
+    return conditions
+
+
 def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, str] | str) -> float:
     """Calculates goal heuristic reward: fraction of satisfied conditions (+100 bonus on full satisfaction)."""
     conditions: list[str] = []
 
     if isinstance(goals, str):
-        # Could be single or combined with " and " / ","
-        parts = re.split(r",\s*and\s+|\s+and\s+|,", goals)
-        conditions = [p.strip() for p in parts if p.strip()]
+        conditions = _split_goal_text(goals)
     elif isinstance(goals, dict):
         for top, bottom in goals.items():
             conditions.append(f"the {top} block is on top of the {bottom} block")
     else:
         for g in goals:
             if isinstance(g, str):
-                parts = re.split(r",\s*and\s+|\s+and\s+|,", g)
-                conditions.extend([p.strip() for p in parts if p.strip()])
+                conditions.extend(_split_goal_text(g))
 
     if not conditions:
         return 100.0
@@ -80,20 +94,49 @@ def calculate_combined_reward(
     alpha: float = 0.5,
     eval_score: float | None = None,
 ) -> float:
-    """Computes combined step reward combining action likelihood/confidence and goal progress."""
-    goal_or_eval = eval_score if eval_score is not None else calculate_goal_reward(state, goals)
-    return float(alpha * action_score + (1.0 - alpha) * goal_or_eval)
+    """Combine R1/R2 and, when available, R3 for a non-terminal transition."""
+    goal_score = calculate_goal_reward(state, goals)
+    if eval_score is not None:
+        return float((action_score + goal_score + eval_score) / 3.0)
+    return float(alpha * action_score + (1.0 - alpha) * goal_score)
+
+
+def self_evaluation_result(
+    llm: BaseLLM,
+    prompt: str,
+) -> tuple[float, float, str | None]:
+    """Return Yes/No probabilities and generated answer when the backend exposes it."""
+    get_result = getattr(llm, "get_token_probabilities_and_response", None)
+    if callable(get_result):
+        probabilities, response = get_result(prompt, ["Yes", "No"])
+        return (
+            float(probabilities.get("Yes", 0.0)),
+            float(probabilities.get("No", 0.0)),
+            str(response) if response is not None else None,
+        )
+
+    get_probabilities = getattr(llm, "get_token_probabilities", None)
+    if callable(get_probabilities):
+        probabilities = get_probabilities(prompt, ["Yes", "No"])
+        return float(probabilities.get("Yes", 0.0)), float(probabilities.get("No", 0.0)), None
+    p_yes = llm.get_token_probability(prompt, "Yes")
+    p_no = llm.get_token_probability(prompt, "No")
+    return p_yes, p_no, None
+
+
+def self_evaluation_probabilities(llm: BaseLLM, prompt: str) -> tuple[float, float]:
+    """Return the model probabilities for Yes and No."""
+    p_yes, p_no, _ = self_evaluation_result(llm, prompt)
+    return p_yes, p_no
 
 
 def score_self_evaluation(llm: BaseLLM, prompt: str) -> float:
-    """Calculates normalized self-evaluation probability from LLM."""
-    p_yes = llm.get_token_probability(prompt, "Yes")
-    p_no = llm.get_token_probability(prompt, "No")
-
+    """Calculate normalized self-evaluation probability from the LLM."""
+    p_yes, p_no = self_evaluation_probabilities(llm, prompt)
     total = p_yes + p_no
     if total > 0.0:
         return float(p_yes / total)
-    return float(p_yes)
+    return 0.5
 
 
 class BlocksworldRewardFunction:
@@ -104,7 +147,7 @@ class BlocksworldRewardFunction:
         goal: Sequence[str] | dict[str, str] | str,
         llm: BaseLLM | None = None,
         alpha: float = 0.5,
-        use_self_eval: bool = False,
+        use_self_eval: bool = True,
     ) -> None:
         self.goal = goal
         self.llm = llm

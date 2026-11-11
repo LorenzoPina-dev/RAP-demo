@@ -160,7 +160,10 @@ class TestLiteLLMClientInitAndProtocol:
                 ),
             )
 
-        client = LiteLLMClient(completion_fn=fake_completion)
+        client = LiteLLMClient(
+            model="ollama/llama3.2",
+            completion_fn=fake_completion,
+        )
         assert client.call_count == 0
 
         client.generate("hello")
@@ -378,71 +381,61 @@ class TestLiteLLMClientGenerate:
 
 
 class TestLiteLLMClientGetLogprobs:
-    """Tests log-probability extraction, fallback behavior, and error handling."""
+    """Tests target-only echo scoring for Ollama and safe uniform fallback elsewhere."""
 
-    def test_get_logprobs_chat_format_object_items(self) -> None:
-        """Sums .logprob from object-style choices[0].logprobs.content."""
-        logprobs_obj = SimpleNamespace(
-            content=[
-                SimpleNamespace(token="Pick", logprob=-0.2),
-                SimpleNamespace(token=" up", logprob=-0.5),
-                SimpleNamespace(token=" red", logprob=-0.3),
+    def test_non_ollama_provider_uses_uniform_fallback(self) -> None:
+        called = False
+
+        def unexpected_completion(**_: Any) -> Any:
+            nonlocal called
+            called = True
+            return _make_obj_response()
+
+        client = LiteLLMClient(model="openai/gpt-4o-mini", completion_fn=unexpected_completion)
+        assert client.get_logprobs("prompt", "target") == 0.0
+        assert not called
+
+    def test_ollama_echo_scores_only_target_tokens(self) -> None:
+        captured: dict[str, Any] = {}
+        prompt = "state: "
+
+        def completion(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        logprobs=SimpleNamespace(
+                            token_logprobs=[-0.1, -0.2, -0.3],
+                            text_offset=[0, len(prompt), len(prompt) + 2],
+                        )
+                    )
+                ]
+            )
+
+        client = LiteLLMClient(
+            model="ollama/llama3.2",
+            api_base="http://localhost:11434",
+            completion_fn=completion,
+        )
+        assert client.get_logprobs(prompt, "red") == pytest.approx(-0.5)
+        assert captured["model"] == "openai/llama3.2"
+        assert captured["api_base"] == "http://localhost:11434/v1"
+        assert captured["prompt"] == "state: red"
+        assert captured["echo"] is True
+        assert captured["max_tokens"] == 0
+
+    def test_ollama_echo_without_offsets_uses_uniform_fallback(self) -> None:
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    logprobs=SimpleNamespace(token_logprobs=[-0.1, -0.2])
+                )
             ]
         )
         client = LiteLLMClient(
-            completion_fn=lambda **_: _make_obj_response("Pick up red", logprobs=logprobs_obj)
+            model="ollama/llama3.2",
+            completion_fn=lambda **_: response,
         )
-        assert client.get_logprobs("State:", "Pick up red") == pytest.approx(-1.0)
-
-    def test_get_logprobs_chat_format_dict_items(self) -> None:
-        """Sums ['logprob'] from dict-style choices[0]['logprobs']['content']."""
-        resp = _make_dict_response(
-            "Stack",
-            logprobs={
-                "content": [
-                    {"token": "Stack", "logprob": -0.15},
-                    {"token": " red", "logprob": -0.35},
-                ]
-            },
-        )
-        client = LiteLLMClient(completion_fn=lambda **_: resp)
-        assert client.get_logprobs("State:", "Stack red") == pytest.approx(-0.5)
-
-    def test_get_logprobs_legacy_token_logprobs_object_and_dict(self) -> None:
-        """Sums legacy choices[0].logprobs.token_logprobs while skipping None entries."""
-        legacy_obj = SimpleNamespace(token_logprobs=[None, -0.4, -0.6])
-        client_obj = LiteLLMClient(
-            completion_fn=lambda **_: _make_obj_response("target", logprobs=legacy_obj)
-        )
-        assert client_obj.get_logprobs("p", "target") == pytest.approx(-1.0)
-
-        legacy_dict = _make_dict_response(
-            "target",
-            logprobs={"token_logprobs": [None, -0.25, -0.75]},
-        )
-        client_dict = LiteLLMClient(completion_fn=lambda **_: legacy_dict)
-        assert client_dict.get_logprobs("p", "target") == pytest.approx(-1.0)
-
-    def test_get_logprobs_empty_content_list_returns_zero(self) -> None:
-        """Empty logprobs.content list returns 0.0."""
-        resp = _make_obj_response("", logprobs=SimpleNamespace(content=[]))
-        client = LiteLLMClient(completion_fn=lambda **_: resp)
-        assert client.get_logprobs("p", "target") == 0.0
-
-    @pytest.mark.parametrize(
-        "response",
-        [
-            _make_obj_response("ok", logprobs=None),
-            _make_dict_response("ok", logprobs=None),
-            {"choices": [{"message": {"content": "ok"}}]},
-            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]),
-        ],
-    )
-    def test_get_logprobs_returns_zero_when_provider_omits_logprobs(
-        self, response: Any
-    ) -> None:
-        """Gracefully returns 0.0 when logprobs is None or absent."""
-        client = LiteLLMClient(completion_fn=lambda **_: response)
         assert client.get_logprobs("prompt", "target") == 0.0
 
     def test_get_logprobs_returns_zero_on_unsupported_params_error(self) -> None:
@@ -457,7 +450,7 @@ class TestLiteLLMClientGetLogprobs:
             )
 
         client = LiteLLMClient(
-            model="anthropic/claude-3-5-sonnet-20241022",
+            model="ollama/llama3.2",
             completion_fn=raise_unsupported,
         )
         assert client.get_logprobs("prompt", "target") == 0.0
@@ -473,7 +466,7 @@ class TestLiteLLMClientGetLogprobs:
                 llm_provider="custom",
             )
 
-        client = LiteLLMClient(model="custom/model", completion_fn=raise_bad_req)
+        client = LiteLLMClient(model="ollama/llama3.2", completion_fn=raise_bad_req)
         assert client.get_logprobs("prompt", "target") == 0.0
 
     def test_get_logprobs_raises_on_timeout_connection_and_auth_errors(self) -> None:
@@ -481,6 +474,7 @@ class TestLiteLLMClientGetLogprobs:
         litellm = _import_litellm()
 
         timeout_client = LiteLLMClient(
+            model="ollama/llama3.2",
             completion_fn=_raising_completion(
                 litellm.Timeout(message="timeout", model="gpt-4o-mini", llm_provider="openai")
             )
@@ -489,6 +483,7 @@ class TestLiteLLMClientGetLogprobs:
             timeout_client.get_logprobs("p", "t")
 
         conn_client = LiteLLMClient(
+            model="ollama/llama3.2",
             completion_fn=_raising_completion(
                 litellm.APIConnectionError(
                     message="conn failed", llm_provider="openai", model="gpt-4o-mini"
@@ -499,6 +494,7 @@ class TestLiteLLMClientGetLogprobs:
             conn_client.get_logprobs("p", "t")
 
         auth_client = LiteLLMClient(
+            model="ollama/llama3.2",
             completion_fn=_raising_completion(
                 litellm.AuthenticationError(
                     message="bad key", llm_provider="openai", model="gpt-4o-mini"

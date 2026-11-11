@@ -6,8 +6,12 @@ import re
 from typing import Any, Optional, Sequence
 from rap_demo.core.mcts import WorldModel
 from rap_demo.domains.blocksworld.models import ActionType, BlockAction, BlockState
-from rap_demo.domains.blocksworld.prompts import build_world_update_prompt
-from rap_demo.domains.blocksworld.rewards import calculate_combined_reward, calculate_goal_reward
+from rap_demo.domains.blocksworld.prompts import build_self_eval_prompt, build_world_update_prompt
+from rap_demo.domains.blocksworld.rewards import (
+    calculate_combined_reward,
+    calculate_goal_reward,
+    self_evaluation_result,
+)
 from rap_demo.llm.base import BaseLLM
 
 
@@ -48,7 +52,10 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
             continue
 
         # 2. Hand now empty
-        if ("hand was holding" in c_lower and "now is empty" in c_lower) or "hand is empty" in c_lower:
+        if (
+            ("hand was holding" in c_lower and "now is empty" in c_lower)
+            or re.search(r"\bhand\s+is\s+(?:now\s+)?empty\b", c_lower)
+        ):
             new_holding = None
             matched_any = True
             continue
@@ -84,7 +91,22 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
             matched_any = True
             continue
 
-        # 6. Block was on top of target and now in hand
+        # 6. A concise equivalent often returned by models: "X is now on top of Y".
+        m = re.search(
+            r"the\s+(\w+)\s+block\s+is\s+(?:now\s+)?on\s+top\s+of\s+the\s+(\w+)\s+block",
+            c_lower,
+        )
+        if m:
+            top = m.group(1)
+            bottom = m.group(2)
+            new_on[top] = bottom
+            new_on_table.discard(top)
+            if new_holding == top:
+                new_holding = None
+            matched_any = True
+            continue
+
+        # 7. Block was on top of target and now in hand
         m = re.search(
             r"the\s+(\w+)\s+block\s+was\s+on\s+top\s+of\s+the\s+(\w+)\s+block\s+and\s+now\s+is\s+in\s+the\s+hand",
             c_lower,
@@ -96,14 +118,14 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
             matched_any = True
             continue
 
-        # 7. Block is no longer clear
+        # 8. Block is no longer clear
         m = re.search(r"the\s+(\w+)\s+block\s+is\s+no\s+longer\s+clear", c_lower)
         if m:
             new_clear.discard(m.group(1))
             matched_any = True
             continue
 
-        # 8. Block is now clear
+        # 9. Block is now clear
         m = re.search(r"the\s+(\w+)\s+block\s+is\s+(?:now\s+)?clear", c_lower)
         if m:
             new_clear.add(m.group(1))
@@ -209,8 +231,8 @@ class BlocksworldWorldModel(WorldModel):
         """Given current state and action, returns (next_state, immediate_reward, is_terminal).
 
         The immediate reward follows the paper's Blocksworld reward (Section 4.1):
-        r1 is the action likelihood (log-probability, stored on the action trace)
-        and r2 is the fraction of goal conditions met by the predicted state.
+        R1 is the action likelihood, R2 is goal progress, and R3 is the
+        model's self-evaluation of the proposed action. R3 is skipped in rollouts.
 
         Args:
             lightweight: When True, skip the LLM world model and use the exact
@@ -261,12 +283,42 @@ class BlocksworldWorldModel(WorldModel):
             # The paper assigns a "super large reward" when every goal condition holds.
             step_reward = goal_reward
         else:
+            action_score = _action_likelihood(action)
+            eval_score = 0.5 if not lightweight else None
+            if not lightweight and self.llm is not None:
+                eval_prompt = build_self_eval_prompt(state, action, self.goal)
+                p_yes, p_no, eval_response = self_evaluation_result(self.llm, eval_prompt)
+                total = p_yes + p_no
+                eval_score = p_yes / total if total > 0.0 else 0.5
+                if call_log is not None:
+                    call_log.append(
+                        {
+                            "phase": "self-evaluation",
+                            "action": action.to_text(),
+                            "prompt": eval_prompt,
+                            "response": (
+                                f"Answer: {eval_response.strip() if eval_response else 'unavailable (probability-only scoring)'}\n"
+                                f"P(Yes)={p_yes:.6f}, P(No)={p_no:.6f}"
+                            ),
+                            "logprob": None,
+                            "prob": None,
+                            "r1": action_score,
+                            "r2": goal_reward,
+                            "r3": eval_score,
+                            "p_yes": p_yes,
+                            "p_no": p_no,
+                            "source": "self-evaluation",
+                            "reason": None,
+                            "error": None,
+                        }
+                    )
             step_reward = calculate_combined_reward(
                 state=next_state,
                 action=action,
                 goals=self.goal,
-                action_score=_action_likelihood(action),
+                action_score=action_score,
                 alpha=self.alpha,
+                eval_score=eval_score,
             )
 
         return next_state, float(step_reward), is_terminal

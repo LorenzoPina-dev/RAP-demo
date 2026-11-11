@@ -197,6 +197,7 @@ class BlocksworldAgent(ReasoningAgent):
                 if state.is_legal_action(action):
                     reason = repaired
                     trace = self._build_trace(prompt, response, payload, "model", reason)
+                    trace.update({"logprob": None, "prob": 1.0})
                     return [replace(action, llm_trace=trace)]
                 reason = f"Model proposed an illegal action: {action.to_text()}"
             except Exception as exc:
@@ -208,7 +209,11 @@ class BlocksworldAgent(ReasoningAgent):
         legal_actions = state.get_legal_actions()
         fallback = legal_actions[: self.num_candidates] if legal_actions and self.num_candidates else legal_actions
         trace = self._build_trace(prompt, response, payload, "fallback", reason)
-        return [replace(action, llm_trace=trace) for action in fallback]
+        probability = 1.0 / len(fallback) if fallback else 0.0
+        return [
+            replace(action, llm_trace={**trace, "logprob": None, "prob": probability})
+            for action in fallback
+        ]
 
     @staticmethod
     def _repair_proposal(proposal: HybridActionProposal) -> tuple[BlockAction, str | None]:

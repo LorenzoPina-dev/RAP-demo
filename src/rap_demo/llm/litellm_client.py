@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -228,6 +229,19 @@ def _match_token_logprob(candidates: Mapping[str, float], token: str) -> float |
     return None
 
 
+def _answer_token_probabilities(content: str | None, tokens: Sequence[str]) -> dict[str, float] | None:
+    """Convert an explicit leading Yes/No answer to a one-hot fallback."""
+    if not content:
+        return None
+    match = re.match(r"\s*([a-z]+)\b", content, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    answer = match.group(1).casefold()
+    if answer not in {token.casefold() for token in tokens}:
+        return None
+    return {token: float(token.casefold() == answer) for token in tokens}
+
+
 class LiteLLMClient(BaseLLM):
     """LLM backend client using LiteLLM for 100+ external API providers."""
 
@@ -340,6 +354,8 @@ class LiteLLMClient(BaseLLM):
         prompt_text = " ".join(
             str(_get_field(message, "content", "")) for message in messages
         )
+        if not prompt_text and kwargs.get("prompt") is not None:
+            prompt_text = str(kwargs["prompt"])
         max_tokens = int(kwargs.get("max_tokens") or 0)
         return TokenRateLimiter.estimate_tokens(prompt_text, max_tokens=max_tokens)
 
@@ -351,6 +367,16 @@ class LiteLLMClient(BaseLLM):
         total_tokens = _get_field(usage, "total_tokens")
         if total_tokens is not None:
             self.rate_limiter.record_actual_tokens(estimated_tokens, int(total_tokens))
+
+    def _ollama_openai_config(self) -> tuple[str, str] | None:
+        """Return the native OpenAI-compatible Ollama model and API base when applicable."""
+        if not self.model.lower().startswith("ollama/"):
+            return None
+        model = f"openai/{self.model.split('/', 1)[1]}"
+        api_base = (self.api_base or "http://localhost:11434/v1").rstrip("/")
+        if not api_base.lower().endswith("/v1"):
+            api_base = f"{api_base}/v1"
+        return model, api_base
 
     def _invoke_completion(self, kwargs: dict[str, Any], *, allow_retries: bool = True) -> Any:
         """Invoke completion with rate-limiting, retry on transient errors, and usage metering."""
@@ -588,16 +614,23 @@ class LiteLLMClient(BaseLLM):
         )
 
     def get_logprobs(self, prompt: str, target: str) -> float:
-        """Calculate total log-probability of target string given prompt.
-
-        Falls back gracefully to 0.0 if the provider does not support logprobs.
-        """
-        kwargs = self._build_completion_kwargs(
-            f"{prompt}{target}",
-            max_tokens=1,
-            temperature=0.0,
-            logprobs=True,
-        )
+        """Score a continuation when the provider can return prompt-token logprobs."""
+        ollama = self._ollama_openai_config()
+        if ollama is None:
+            return 0.0
+        model, api_base = ollama
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "prompt": f"{prompt}{target}",
+            "max_tokens": 0,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "echo": True,
+            "timeout": self.timeout,
+            "api_base": api_base,
+        }
+        if self.api_key is not None:
+            kwargs["api_key"] = self.api_key
         try:
             response = self._invoke_completion(kwargs)
         except Exception as exc:
@@ -610,27 +643,41 @@ class LiteLLMClient(BaseLLM):
         if logprobs is None:
             return 0.0
 
-        content_lps = _get_field(logprobs, "content")
-        if isinstance(content_lps, Sequence) and not isinstance(content_lps, (str, bytes)):
-            valid_lps = [
-                float(lp)
-                for item in content_lps
-                if (lp := _get_field(item, "logprob")) is not None
-            ]
-            return float(sum(valid_lps)) if valid_lps else 0.0
-
         token_lps = _get_field(logprobs, "token_logprobs")
-        if isinstance(token_lps, Sequence) and not isinstance(token_lps, (str, bytes)):
-            valid_lps = [float(lp) for lp in token_lps if lp is not None]
-            return float(sum(valid_lps)) if valid_lps else 0.0
-
-        return 0.0
+        offsets = _get_field(logprobs, "text_offset")
+        if not (
+            isinstance(token_lps, Sequence)
+            and not isinstance(token_lps, (str, bytes))
+            and isinstance(offsets, Sequence)
+            and not isinstance(offsets, (str, bytes))
+            and len(token_lps) == len(offsets)
+        ):
+            return 0.0
+        target_logprobs = [
+            float(lp)
+            for offset, lp in zip(offsets, token_lps)
+            if offset is not None and int(offset) >= len(prompt) and lp is not None
+        ]
+        return float(sum(target_logprobs)) if target_logprobs else 0.0
 
     def get_token_probability(self, prompt: str, token: str) -> float:
+        """Return one candidate probability using the shared multi-token request."""
+        return self.get_token_probabilities(prompt, [token]).get(token, 0.0)
+
+    def get_token_probabilities(self, prompt: str, tokens: Sequence[str]) -> dict[str, float]:
+        """Return candidate probabilities from a single completion request."""
+        probabilities, _ = self.get_token_probabilities_and_response(prompt, tokens)
+        return probabilities
+
+    def get_token_probabilities_and_response(
+        self,
+        prompt: str,
+        tokens: Sequence[str],
+    ) -> tuple[dict[str, float], str | None]:
         """Extract the probability of a candidate token following prompt.
 
-        Uses top_logprobs when supported by the provider, falling back to
-        stripped content matching when top_logprobs are unavailable.
+        Returns the generated text as well, so R3 can log the model's answer from the
+        same request instead of issuing a separate generation call.
         """
         kwargs = self._build_completion_kwargs(
             prompt,
@@ -639,6 +686,9 @@ class LiteLLMClient(BaseLLM):
             logprobs=True,
             top_logprobs=10,
         )
+        ollama = self._ollama_openai_config()
+        if ollama is not None:
+            kwargs["model"], kwargs["api_base"] = ollama
         try:
             response = self._invoke_completion(kwargs)
         except Exception as exc:
@@ -654,21 +704,32 @@ class LiteLLMClient(BaseLLM):
                 response = self._invoke_completion(fallback_kwargs)
             except Exception as fallback_exc:
                 if _is_unsupported_param_error(fallback_exc):
-                    return 0.0
+                    return {token: 0.0 for token in tokens}, None
                 raise _map_exception(fallback_exc) from fallback_exc
 
         choice = _extract_first_choice(response)
         if choice is None:
-            return 0.0
-
-        candidates = _extract_top_logprob_candidates(_get_field(choice, "logprobs"))
-        if candidates:
-            target_lp = _match_token_logprob(candidates, token)
-            if target_lp is None:
-                return 0.0
-            return float(max(0.0, min(1.0, math.exp(target_lp))))
+            return {token: 0.0 for token in tokens}, None
 
         content = _extract_message_content(choice)
-        if content is None:
-            return 0.0
-        return 1.0 if content.strip() == token.strip() else 0.0
+        candidates = _extract_top_logprob_candidates(_get_field(choice, "logprobs"))
+        if candidates:
+            matched = {
+                token: _match_token_logprob(candidates, token)
+                for token in tokens
+            }
+            if any(logprob is not None for logprob in matched.values()):
+                return (
+                    {
+                        token: float(max(0.0, min(1.0, math.exp(logprob))))
+                        if logprob is not None
+                        else 0.0
+                        for token, logprob in matched.items()
+                    },
+                    content,
+                )
+
+        answer_probabilities = _answer_token_probabilities(content, tokens)
+        if answer_probabilities is not None:
+            return answer_probabilities, content
+        return {token: 0.0 for token in tokens}, content

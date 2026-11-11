@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from collections.abc import Callable
 from typing import Any
@@ -270,23 +271,41 @@ class LlamaServerClient(BaseLLM):
 
         logprobs_data = choice.get("logprobs")
         if not isinstance(logprobs_data, dict):
-            raise LLMError("Malformed LLM response: missing 'logprobs' object")
-
-        token_logprobs = logprobs_data.get("token_logprobs")
-        if token_logprobs is None:
-            raise LLMError("Malformed LLM response: missing 'token_logprobs'")
-
-        valid_lps = [float(lp) for lp in token_logprobs if lp is not None]
-        if not valid_lps:
             return 0.0
-        return float(sum(valid_lps))
+        token_logprobs = logprobs_data.get("token_logprobs")
+        offsets = logprobs_data.get("text_offset")
+        if (
+            not isinstance(token_logprobs, list)
+            or not isinstance(offsets, list)
+            or len(token_logprobs) != len(offsets)
+        ):
+            return 0.0
+        target_logprobs = [
+            float(lp)
+            for offset, lp in zip(offsets, token_logprobs)
+            if offset is not None and int(offset) >= len(prompt) and lp is not None
+        ]
+        return float(sum(target_logprobs)) if target_logprobs else 0.0
 
     def get_token_probability(self, prompt: str, token: str) -> float:
-        """Extract the probability of a candidate token following prompt from top_logprobs.
+        """Return one candidate probability using the shared multi-token request."""
+        return self.get_token_probabilities(prompt, [token]).get(token, 0.0)
+
+    def get_token_probabilities(self, prompt: str, tokens: list[str]) -> dict[str, float]:
+        """Return candidate probabilities from a single completion request."""
+        probabilities, _ = self.get_token_probabilities_and_response(prompt, tokens)
+        return probabilities
+
+    def get_token_probabilities_and_response(
+        self,
+        prompt: str,
+        tokens: list[str],
+    ) -> tuple[dict[str, float], str | None]:
+        """Extract probabilities for candidate tokens from one top_logprobs response.
 
         Args:
             prompt: Context or prefix prompt.
-            token: Candidate token string (e.g. 'Yes' or 'No').
+            tokens: Candidate token strings (e.g. 'Yes' and 'No').
 
         Returns:
             Extracted probability converted via exp and clamped to [0.0, 1.0].
@@ -309,36 +328,58 @@ class LlamaServerClient(BaseLLM):
         if not isinstance(choice, dict):
             raise LLMError("Malformed LLM response: choice is not a dict")
 
+        response_text = choice.get("text")
+        response_text = str(response_text) if response_text is not None else None
         logprobs_data = choice.get("logprobs")
-        if not isinstance(logprobs_data, dict):
-            raise LLMError("Malformed LLM response: missing 'logprobs' object")
-
-        top_logprobs_list = logprobs_data.get("top_logprobs")
-        if not top_logprobs_list or not isinstance(top_logprobs_list, list):
-            return 0.0
-
-        first_top_logprobs: dict[str, float] = top_logprobs_list[0]
+        top_logprobs_list = (
+            logprobs_data.get("top_logprobs")
+            if isinstance(logprobs_data, dict)
+            else None
+        )
+        first_top_logprobs = (
+            top_logprobs_list[0]
+            if isinstance(top_logprobs_list, list) and top_logprobs_list
+            else None
+        )
         if not isinstance(first_top_logprobs, dict):
-            return 0.0
+            return self._answer_probabilities_or_zero(response_text, tokens), response_text
 
-        # Search candidate token with exact match, leading space, or stripped match
-        target_lp: float | None = None
-        if token in first_top_logprobs:
-            target_lp = first_top_logprobs[token]
-        elif f" {token}" in first_top_logprobs:
-            target_lp = first_top_logprobs[f" {token}"]
-        else:
-            token_stripped = token.strip()
-            for k, lp in first_top_logprobs.items():
-                if k.strip() == token_stripped:
-                    target_lp = lp
-                    break
+        probabilities: dict[str, float] = {}
+        matched_any = False
+        for token in tokens:
+            target_lp: float | None = None
+            if token in first_top_logprobs:
+                target_lp = first_top_logprobs[token]
+            elif f" {token}" in first_top_logprobs:
+                target_lp = first_top_logprobs[f" {token}"]
+            else:
+                token_stripped = token.strip()
+                for candidate, logprob in first_top_logprobs.items():
+                    if candidate.strip() == token_stripped:
+                        target_lp = logprob
+                        break
+            matched_any = matched_any or target_lp is not None
+            probabilities[token] = (
+                float(max(0.0, min(1.0, math.exp(target_lp))))
+                if target_lp is not None
+                else 0.0
+            )
+        if not matched_any:
+            return self._answer_probabilities_or_zero(response_text, tokens), response_text
+        return probabilities, response_text
 
-        if target_lp is None:
-            return 0.0
-
-        prob = math.exp(target_lp)
-        return float(max(0.0, min(1.0, prob)))
+    @staticmethod
+    def _answer_probabilities_or_zero(
+        response: str | None,
+        tokens: list[str],
+    ) -> dict[str, float]:
+        if response:
+            match = re.match(r"\s*([a-z]+)\b", response, flags=re.IGNORECASE)
+            if match is not None:
+                answer = match.group(1).casefold()
+                if answer in {token.casefold() for token in tokens}:
+                    return {token: float(token.casefold() == answer) for token in tokens}
+        return {token: 0.0 for token in tokens}
 
     def start_server(self) -> None:
         """Launch local llama-server subprocess if server_command was specified."""

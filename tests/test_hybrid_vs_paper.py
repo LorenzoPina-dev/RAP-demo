@@ -242,12 +242,12 @@ class TestThoughtPreservation:
 class TestLLMCallEfficiency:
     """Compares LLM invocation counts between Hybrid and Paper modes."""
 
-    def test_hybrid_world_model_makes_zero_llm_calls(
+    def test_hybrid_world_model_uses_one_r3_call_per_step(
         self,
         instance_5_initial_state: BlockState,
         instance_5_goal: list[str],
     ) -> None:
-        """Hybrid world model simulation performs 0 LLM calls, saving latency and cost."""
+        """Hybrid transitions stay local while self-evaluation supplies R3."""
         hybrid_llm = MockLLM()
         world_model = BlocksworldWorldModel(
             goal=instance_5_goal,
@@ -259,15 +259,15 @@ class TestLLMCallEfficiency:
         world_model.step(instance_5_initial_state, action)
         world_model.step(instance_5_initial_state, action)
 
-        # Exactly zero calls to LLM for world transition
-        assert hybrid_llm.call_count == 0
+        assert hybrid_llm.call_count == 2
+        assert all(call.method == "get_token_probabilities" for call in hybrid_llm.calls)
 
     def test_paper_world_model_makes_llm_call_per_step(
         self,
         instance_5_initial_state: BlockState,
         instance_5_goal: list[str],
     ) -> None:
-        """Paper world model queries the LLM for every state transition simulation."""
+        """Paper mode calls the LLM for the transition and paired R3 probabilities."""
         change_text = (
             "[CHANGE] the hand was empty and now is holding the red block, "
             "the red block was on the table and now is in the hand, "
@@ -282,10 +282,14 @@ class TestLLMCallEfficiency:
 
         action = BlockAction(ActionType.PICK_UP, "red")
         world_model.step(instance_5_initial_state, action)
-        assert paper_llm.call_count == 1
+        assert paper_llm.call_count == 2
+        assert [call.method for call in paper_llm.calls] == [
+            "generate",
+            "get_token_probabilities",
+        ]
 
         world_model.step(instance_5_initial_state, action)
-        assert paper_llm.call_count == 2
+        assert paper_llm.call_count == 4
 
 
 # ============================================================================

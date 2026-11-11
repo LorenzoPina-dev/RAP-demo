@@ -201,3 +201,23 @@ class MockLLM(BaseLLM):
             prob = float(self.default_token_prob)
 
         return float(max(0.0, min(1.0, prob)))
+
+    def get_token_probabilities(self, prompt: str, tokens: list[str]) -> dict[str, float]:
+        """Return configured token probabilities with one recorded mock call."""
+        self._calls.append(
+            LLMCall(
+                method="get_token_probabilities",
+                prompt=prompt,
+                args={"tokens": list(tokens)},
+            )
+        )
+        probabilities: dict[str, float] = {}
+        for token in tokens:
+            if (prompt, token) in self.token_probs:
+                prob = float(self.token_probs[(prompt, token)])
+            elif token in self.token_probs:
+                prob = float(self.token_probs[token])
+            else:
+                prob = float(self.default_token_prob)
+            probabilities[token] = float(max(0.0, min(1.0, prob)))
+        return probabilities
