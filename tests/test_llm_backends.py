@@ -720,8 +720,10 @@ class TestLiteLLMOllamaLogprobs:
         assert completion_calls[0]["model"] == "openai/llama3.2"
         assert completion_calls[0]["echo"] is True
         assert completion_calls[0]["max_tokens"] == 0
+        assert completion_calls[0]["api_key"] == "ollama"
         assert completion_calls[1]["top_logprobs"] == 10
         assert completion_calls[1]["model"] == "openai/llama3.2"
+        assert completion_calls[1]["api_key"] == "ollama"
 
     def test_r3_uses_generated_answer_when_candidate_logprobs_are_missing(self) -> None:
         client = LiteLLMClient(

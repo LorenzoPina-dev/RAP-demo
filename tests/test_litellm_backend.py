@@ -423,6 +423,7 @@ class TestLiteLLMClientGetLogprobs:
         assert captured["prompt"] == "state: red"
         assert captured["echo"] is True
         assert captured["max_tokens"] == 0
+        assert captured["api_key"] == "ollama"
 
     def test_ollama_echo_without_offsets_uses_uniform_fallback(self) -> None:
         response = SimpleNamespace(
@@ -721,6 +722,134 @@ class TestLiteLLMClientGetTokenProbability:
                     )
                 )
             ).get_token_probability("p", "Yes")
+
+
+class TestLiteLLMClientSelfEvaluationRetry:
+    """Reasoning models need a larger token budget before they emit Yes/No."""
+
+    def test_retries_with_larger_budget_when_first_token_is_a_channel_marker(self) -> None:
+        """max_tokens=1 yields <|channel|>; the retry reads the real answer and logprobs."""
+        calls: list[int] = []
+
+        first = _make_obj_response(
+            "",
+            logprobs=SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        token="<|channel|>",
+                        logprob=0.0,
+                        top_logprobs=[SimpleNamespace(token="<|channel|>", logprob=0.0)],
+                    )
+                ]
+            ),
+        )
+        second = _make_obj_response(
+            "Yes",
+            logprobs=SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        token="analysis",
+                        logprob=-0.1,
+                        top_logprobs=[SimpleNamespace(token="analysis", logprob=-0.1)],
+                    ),
+                    SimpleNamespace(
+                        token="Yes",
+                        logprob=math.log(0.85),
+                        top_logprobs=[
+                            SimpleNamespace(token="Yes", logprob=math.log(0.85)),
+                            SimpleNamespace(token="No", logprob=math.log(0.15)),
+                        ],
+                    ),
+                ]
+            ),
+        )
+        responses = [first, second]
+
+        def completion(**kwargs: Any) -> Any:
+            calls.append(int(kwargs["max_tokens"]))
+            return responses.pop(0)
+
+        client = LiteLLMClient(completion_fn=completion)
+        probabilities, response = client.get_token_probabilities_and_response(
+            "Is this action promising? Answer Yes or No:", ["Yes", "No"]
+        )
+
+        assert response == "Yes"
+        assert probabilities["Yes"] == pytest.approx(0.85)
+        assert probabilities["No"] == pytest.approx(0.15)
+        assert calls == [1, 512]
+
+    def test_reads_the_last_yes_no_token_not_the_first(self) -> None:
+        """A reasoning transcript can mention Yes before the final answer."""
+        response = _make_obj_response(
+            "Yes",
+            logprobs=SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        token="Yes",
+                        logprob=math.log(0.2),
+                        top_logprobs=[
+                            SimpleNamespace(token="Yes", logprob=math.log(0.2)),
+                            SimpleNamespace(token="No", logprob=math.log(0.8)),
+                        ],
+                    ),
+                    SimpleNamespace(
+                        token="Yes",
+                        logprob=math.log(0.95),
+                        top_logprobs=[
+                            SimpleNamespace(token="Yes", logprob=math.log(0.95)),
+                            SimpleNamespace(token="No", logprob=math.log(0.05)),
+                        ],
+                    ),
+                ]
+            ),
+        )
+        client = LiteLLMClient(completion_fn=lambda **_: response)
+        probabilities, _ = client.get_token_probabilities_and_response("q", ["Yes", "No"])
+        assert probabilities["Yes"] == pytest.approx(0.95)
+        assert probabilities["No"] == pytest.approx(0.05)
+
+    def test_special_token_only_content_still_triggers_retry(self) -> None:
+        """Content made only of special tokens is not treated as a real answer."""
+        calls: list[int] = []
+        responses = [
+            _make_obj_response("<|channel|>", logprobs=None),
+            _make_obj_response("No", logprobs=None),
+        ]
+
+        def completion(**kwargs: Any) -> Any:
+            calls.append(int(kwargs["max_tokens"]))
+            return responses.pop(0)
+
+        client = LiteLLMClient(completion_fn=completion)
+        probabilities, response = client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert response == "No"
+        assert probabilities == {"Yes": 0.0, "No": 1.0}
+        assert calls == [1, 512]
+
+    def test_truncated_reasoning_text_is_not_a_usable_answer(self) -> None:
+        """qwen3.5 can spend the retry budget on reasoning and return only a prefix.
+
+        Text such as "Thinking" is not a Yes/No answer, so the client must retry
+        with the larger budget instead of reporting P(Yes)=P(No)=0.
+        """
+        calls: list[int] = []
+        responses = [
+            _make_obj_response("Thinking", logprobs=None),
+            _make_obj_response("Yes", logprobs=None),
+        ]
+
+        def completion(**kwargs: Any) -> Any:
+            calls.append(int(kwargs["max_tokens"]))
+            return responses.pop(0)
+
+        client = LiteLLMClient(completion_fn=completion)
+        probabilities, response = client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert response == "Yes"
+        assert probabilities == {"Yes": 1.0, "No": 0.0}
+        assert calls == [1, 512]
 
 
 # ============================================================================

@@ -131,11 +131,15 @@ def self_evaluation_probabilities(llm: BaseLLM, prompt: str) -> tuple[float, flo
 
 
 def score_self_evaluation(llm: BaseLLM, prompt: str) -> float:
-    """Calculate normalized self-evaluation probability from the LLM."""
+    """Calculate the self-evaluation reward from the LLM.
+
+    The RAP paper (Section 3.2) uses the next-word probability of the token
+    " Yes" directly as R3, so this returns P(Yes) rather than a renormalized
+    Yes/No ratio.
+    """
     p_yes, p_no = self_evaluation_probabilities(llm, prompt)
-    total = p_yes + p_no
-    if total > 0.0:
-        return float(p_yes / total)
+    if p_yes + p_no > 0.0:
+        return float(max(0.0, min(1.0, p_yes)))
     return 0.5
 
 

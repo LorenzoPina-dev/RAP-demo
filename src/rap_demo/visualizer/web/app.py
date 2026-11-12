@@ -17,7 +17,6 @@ from rap_demo.core.mcts import extract_best_trajectory
 from rap_demo.domains.blocksworld.models import BlockState
 from rap_demo.domains.blocksworld.problem import parse_goal, parse_initial_state
 from rap_demo.llm.base import LLMError
-from rap_demo.storage.runs import deserialize_tree, list_runs, load_run
 from rap_demo.visualizer.serializer import serialize_blocksworld_state, serialize_tree
 from rap_demo.visualizer.web.controller import SearchController
 
@@ -158,15 +157,21 @@ def create_app(
     @server.get("/api/runs")
     async def get_runs(limit: int = 50) -> dict[str, Any]:
         """Lists saved runs available for replay, newest first."""
+        # Imported lazily to keep rap_demo.storage.runs -> visualizer.serializer
+        # from forming an import cycle at package initialisation time.
+        from rap_demo.storage.runs import list_runs
+
         bounded = max(0, min(int(limit), 500))
         return {"runs": list_runs(runs_dir=runs_dir, limit=bounded)}
 
     @server.post("/api/replay")
     async def post_replay(request: ReplayRequest) -> dict[str, Any]:
         """Loads a saved run and switches the controller to replay mode (no LLM calls)."""
+        from rap_demo.storage.runs import deserialize_tree, load_run
+
         try:
             run_data = load_run(request.ref, runs_dir=runs_dir)
-            root = deserialize_tree(run_data["tree"])
+            root = deserialize_tree(run_data["tree"], goal=run_data.get("goal"))
             replay_path = extract_best_trajectory(root)
             if not replay_path:
                 replay_path = [root]
@@ -274,12 +279,15 @@ def create_app(
     @server.post("/api/search/reset")
     async def post_reset() -> dict[str, Any]:
         """Resets search tree and iteration counter."""
-        res = await ctrl.reset()
+        await ctrl.reset()
         return {
             "iteration": ctrl.iteration,
             "max_iterations": ctrl.max_iterations,
-            "status": ctrl.status.value if hasattr(ctrl.status, "value") else str(ctrl.status),
+            "status": _status_value(ctrl),
+            "tree": serialize_tree(ctrl.root),
+            "state": _serialize_current_state(ctrl),
             "best_path_ids": ctrl.get_best_path_ids(),
+            "replay": ctrl.is_replay,
         }
 
     @server.get("/api/stream")

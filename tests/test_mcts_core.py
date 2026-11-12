@@ -413,6 +413,33 @@ class TestMCTSExpansion:
         assert left_node.parent is root
         assert left_node.is_terminal is False
 
+    def test_expand_copies_reward_components_from_world_model_sink(self) -> None:
+        """Expansion stores r1/r2/r3 on the child so the inspector can show them."""
+
+        class ComponentWorld:
+            def get_actions(self, state: Any, remaining_steps: int | None = None) -> list[str]:
+                return ["go"]
+
+            def step(
+                self,
+                state: Any,
+                action: Any,
+                reward_sink: dict[str, Any] | None = None,
+            ) -> tuple[str, float, bool]:
+                if reward_sink is not None:
+                    reward_sink.update({"r1": 0.2, "r2": 0.3, "r3": 0.4, "reward": 0.3})
+                return "next", 0.3, False
+
+        mcts = MCTS(world_model=ComponentWorld(), reasoning_agent=ComponentWorld())
+        root = MCTSNode(state="start", depth=0)
+
+        children = mcts.expand(root)
+
+        assert len(children) == 1
+        assert children[0].r1 == 0.2
+        assert children[0].r2 == 0.3
+        assert children[0].r3 == 0.4
+
     def test_expand_terminal_node_produces_no_children(self) -> None:
         """Expanding a terminal state yields an empty child list and does not mutate tree."""
         env = DeterministicGraphWorld()

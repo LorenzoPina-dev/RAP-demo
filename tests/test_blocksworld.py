@@ -967,6 +967,23 @@ class TestBlocksworldWorldModel:
         assert call_log[-1]["response"].startswith("Answer: unavailable")
         assert call_log[-1]["r3"] == 0.8
 
+    def test_r3_uses_raw_yes_probability_not_a_renormalized_ratio(self) -> None:
+        """Paper Section 3.2: R3 is the next-word probability of the token " Yes"."""
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red", llm_trace={"prob": 0.25})
+        mock_llm = MockLLM(token_probs={"Yes": 0.8, "No": 0.8})
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="hybrid",
+        )
+        reward_sink: dict[str, Any] = {}
+
+        _, reward, _ = world_model.step(state, action, reward_sink=reward_sink)
+
+        assert reward_sink["r3"] == pytest.approx(0.8)
+        assert reward == pytest.approx((0.25 + 0.0 + 0.8) / 3)
+
     def test_world_model_uses_neutral_r3_when_probabilities_are_missing(self) -> None:
         state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
         action = BlockAction(ActionType.PICK_UP, "red", llm_trace={"prob": 0.25})
@@ -982,6 +999,29 @@ class TestBlocksworldWorldModel:
 
         assert call_log[-1]["r3"] == 0.5
         assert math.isclose(reward, (0.25 + 0.0 + 0.5) / 3)
+
+    def test_world_model_fills_reward_sink_with_r1_r2_r3(self) -> None:
+        """The optional reward sink exposes the breakdown shown in MCTS metrics."""
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(
+            ActionType.PICK_UP,
+            "red",
+            llm_trace={"prob": 0.25},
+        )
+        mock_llm = MockLLM(token_probs={"Yes": 0.8, "No": 0.2})
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="hybrid",
+        )
+        reward_sink: dict[str, Any] = {}
+
+        _, reward, _ = world_model.step(state, action, reward_sink=reward_sink)
+
+        assert reward_sink["r1"] == 0.25
+        assert reward_sink["r2"] == 0.0
+        assert reward_sink["r3"] == 0.8
+        assert math.isclose(reward_sink["reward"], reward)
 
     def test_world_model_skips_r3_in_lightweight_rollout(self) -> None:
         state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})

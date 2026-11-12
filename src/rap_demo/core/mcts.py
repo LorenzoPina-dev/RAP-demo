@@ -80,6 +80,7 @@ def _action_call_entry(action: Any) -> dict[str, Any] | None:
         "response": response,
         "logprob": trace.get("logprob"),
         "prob": trace.get("prob"),
+        "r1_source": trace.get("r1_source"),
         "source": source,
         "reason": trace.get("reason"),
         "error": None,
@@ -92,12 +93,16 @@ def _world_step(
     action: Any,
     lightweight: bool = False,
     call_log: list[dict[str, Any]] | None = None,
+    reward_sink: dict[str, Any] | None = None,
 ) -> tuple[Any, float, bool]:
     """Calls ``step``, requesting the lightweight transition when supported.
 
     The paper (Section 3.3) discards computationally costly reward components
     during simulation. For Blocksworld the costly component is the LLM world
     model, so rollouts can use the exact physics simulator instead.
+
+    ``reward_sink`` receives the r1/r2/r3 breakdown when the world model can
+    expose it, so the inspector can show the components of the node reward.
     """
     try:
         parameters = inspect.signature(world_model.step).parameters
@@ -108,6 +113,8 @@ def _world_step(
         kwargs["lightweight"] = lightweight
     if "call_log" in parameters and call_log is not None:
         kwargs["call_log"] = call_log
+    if "reward_sink" in parameters and reward_sink is not None:
+        kwargs["reward_sink"] = reward_sink
     return world_model.step(state, action, **kwargs) if kwargs else world_model.step(state, action)
 
 
@@ -117,6 +124,7 @@ def _safe_step(
     action: Any,
     lightweight: bool,
     call_log: list[dict[str, Any]] | None = None,
+    reward_sink: dict[str, Any] | None = None,
 ) -> tuple[Any, float, bool]:
     """Predicts the next state, repairing an unusable LLM prediction with exact physics.
 
@@ -126,11 +134,24 @@ def _safe_step(
     kill the whole search tree.
     """
     try:
-        return _world_step(world_model, state, action, lightweight=lightweight, call_log=call_log)
+        return _world_step(
+            world_model,
+            state,
+            action,
+            lightweight=lightweight,
+            call_log=call_log,
+            reward_sink=reward_sink,
+        )
     except (ValueError, KeyError, AssertionError):
         if lightweight:
             raise
-        return _world_step(world_model, state, action, lightweight=True)
+        return _world_step(
+            world_model,
+            state,
+            action,
+            lightweight=True,
+            reward_sink=reward_sink,
+        )
 
 
 def _propose_actions(
@@ -331,9 +352,15 @@ class MCTS:
                 node.llm_calls.append(entry)
 
         for action in actions:
+            reward_components: dict[str, Any] = {}
             try:
                 next_state, step_reward, is_terminal = _safe_step(
-                    self.world_model, node.state, action, lightweight=False, call_log=node.llm_calls
+                    self.world_model,
+                    node.state,
+                    action,
+                    lightweight=False,
+                    call_log=node.llm_calls,
+                    reward_sink=reward_components,
                 )
             except (ValueError, KeyError, AssertionError):
                 # A hallucinated world-model transition must not kill the search:
@@ -351,6 +378,7 @@ class MCTS:
                 thought=getattr(action, "thought", None),
                 llm_trace=getattr(action, "llm_trace", None),
             )
+            child.set_reward_components(reward_components)
             child.prior = _action_prior(action)
             node.children.append(child)
 
@@ -385,10 +413,16 @@ class MCTS:
             best_reward = -math.inf
             best_is_terminal = False
 
+            best_components: dict[str, Any] = {}
             for action in actions:
+                reward_components: dict[str, Any] = {}
                 try:
                     next_state, reward, is_terminal = _safe_step(
-                        self.world_model, curr.state, action, lightweight=True
+                        self.world_model,
+                        curr.state,
+                        action,
+                        lightweight=True,
+                        reward_sink=reward_components,
                     )
                 except (ValueError, KeyError, AssertionError):
                     continue
@@ -397,6 +431,7 @@ class MCTS:
                     best_action = action
                     best_next_state = next_state
                     best_is_terminal = is_terminal
+                    best_components = reward_components
 
             if best_action is None:
                 break
@@ -411,6 +446,7 @@ class MCTS:
                 thought=getattr(best_action, "thought", None),
                 llm_trace=getattr(best_action, "llm_trace", None),
             )
+            next_node.set_reward_components(best_components)
             sim_path.append(next_node)
             rollout_reward += discount_power * best_reward
             discount_power *= self.discount

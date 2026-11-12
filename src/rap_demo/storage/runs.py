@@ -13,6 +13,7 @@ from typing import Any
 from rap_demo.core.mcts import extract_best_trajectory
 from rap_demo.core.node import MCTSNode
 from rap_demo.domains.blocksworld.models import BlockState
+from rap_demo.domains.blocksworld.rewards import calculate_goal_reward
 from rap_demo.visualizer.serializer import _serialize_state, serialize_tree
 
 
@@ -83,6 +84,9 @@ def _serialize_trajectory_steps(best_path: list[MCTSNode]) -> list[dict[str, Any
                 "thought": thought,
                 "llm_trace": getattr(node, "llm_trace", None),
                 "reward": float(node.reward),
+                "r1": getattr(node, "r1", None),
+                "r2": getattr(node, "r2", None),
+                "r3": getattr(node, "r3", None),
                 "visits": int(node.N),
                 "Q": q_val,
                 "is_terminal": bool(node.is_terminal),
@@ -143,8 +147,16 @@ def save_run(
     return file_path
 
 
-def deserialize_tree(tree_data: dict[str, Any], parent: MCTSNode | None = None) -> MCTSNode:
-    """Reconstruct an MCTSNode tree (including stats and BlockState) from serialized JSON."""
+def deserialize_tree(
+    tree_data: dict[str, Any],
+    parent: MCTSNode | None = None,
+    goal: Any = None,
+) -> MCTSNode:
+    """Reconstruct an MCTSNode tree (including stats and BlockState) from serialized JSON.
+
+    When ``goal`` is supplied, missing r2 values from older run files are
+    recomputed from the node state so replay mode can still show the breakdown.
+    """
     node = MCTSNode(
         state=_reconstruct_state(tree_data.get("state")),
         action=tree_data.get("action"),
@@ -155,6 +167,9 @@ def deserialize_tree(tree_data: dict[str, Any], parent: MCTSNode | None = None) 
         thought=tree_data.get("thought"),
         llm_trace=tree_data.get("llm_trace"),
         llm_calls=tree_data.get("llm_calls"),
+        r1=tree_data.get("r1"),
+        r2=tree_data.get("r2"),
+        r3=tree_data.get("r3"),
     )
     node.N = int(tree_data.get("visits", 0))
     node.Q = float(tree_data.get("Q", 0.0))
@@ -162,8 +177,14 @@ def deserialize_tree(tree_data: dict[str, Any], parent: MCTSNode | None = None) 
     node.M = -math.inf if raw_m is None else float(raw_m)
     node.visited = node.N > 0
 
+    if node.r2 is None and goal is not None and isinstance(node.state, BlockState):
+        try:
+            node.r2 = float(calculate_goal_reward(node.state, goal))
+        except (TypeError, ValueError):
+            pass
+
     for child_data in tree_data.get("children", []) or []:
-        node.children.append(deserialize_tree(child_data, parent=node))
+        node.children.append(deserialize_tree(child_data, parent=node, goal=goal))
 
     return node
 

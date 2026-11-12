@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from rap_demo.cli import _create_llm, build_parser, main
+from rap_demo.cli import _create_llm, _resolve_execution_llm_config, build_parser, main
 from rap_demo.config import (
     ModelProfile,
     ModelsConfig,
@@ -456,6 +456,38 @@ class TestModelsConfigCLIIntegration:
         assert rc == 0
         assert len(created_llms) == 1
         assert isinstance(created_llms[0], MockLLM)
+
+    def test_unresolved_model_defaults_to_litellm_not_mock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--model` with no models.json profile must not silently fall back to MockLLM.
+
+        Regression: `rap ui --model ollama\\qwen3.5:9b` from a directory without
+        models.json produced P(Yes)=P(No)=0.5 and uniform r1 values because the
+        backend stayed at its "mock" default.
+        """
+        monkeypatch.chdir(tmp_path)  # no models.json here
+
+        parser = build_parser()
+        args = parser.parse_args(["ui", "--model", "ollama\\qwen3.5:9b"])
+        resolved = _resolve_execution_llm_config(args)
+
+        assert resolved["backend"] == "litellm"
+        assert resolved["model"] == "ollama/qwen3.5:9b"
+        assert resolved["notices"]
+
+    def test_explicit_mock_backend_is_respected_for_unresolved_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit `--backend mock` keeps MockLLM even when the model is unknown."""
+        monkeypatch.chdir(tmp_path)
+
+        parser = build_parser()
+        args = parser.parse_args(["run", "--model", "some-model", "--backend", "mock"])
+        resolved = _resolve_execution_llm_config(args)
+
+        assert resolved["backend"] == "mock"
+        assert resolved["notices"]
 
     def test_cli_models_subcommand_lists_configured_models_and_handles_empty(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch

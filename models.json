@@ -35,7 +35,13 @@
       "model": "ollama/gpt-oss:20b",
       "api_base": "http://localhost:11434",
       "timeout": 300.0,
-      "reasoning_effort": "low"
+      "reasoning_effort": "high"
+    },
+    "qwen3.5-9b": {
+      "backend": "litellm",
+      "model": "ollama/qwen3.5:9b",
+      "api_base": "http://localhost:11434",
+      "timeout": 300.0
     }
   }
 }

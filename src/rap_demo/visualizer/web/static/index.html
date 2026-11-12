@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RAP Visualizer — Reasoning via Planning</title>
-  <link rel="stylesheet" href="/static/style.css?v=16">
+  <link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body>
   <header class="topbar">
@@ -47,15 +47,15 @@
           <span>Pause</span>
         </button>
 
+        <button id="btn-replay" class="btn" title="Choose a saved run from runs/ and replay it with Step / Play (no LLM calls)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><polygon points="10 9 16 12 10 15 10 9"></polygon></svg>
+          <span>Replay</span>
+        </button>
+
         <button id="btn-reset" class="btn btn-ghost-danger" title="Reset tree and state (R)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path></svg>
           <span>Reset</span>
           <kbd>R</kbd>
-        </button>
-
-        <button id="btn-replay" class="btn" title="Replay a saved run without calling the LLM">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><polygon points="10 9 16 12 10 15 10 9"></polygon></svg>
-          <span>Replay</span>
         </button>
       </div>
 
@@ -295,6 +295,6 @@
 
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-  <script src="/static/app.js?v=17"></script>
+  <script src="/static/app.js?v=18"></script>
 </body>
 </html>

@@ -54,6 +54,7 @@ from rap_demo.visualizer.web.controller import (
     SearchStatus,
     _build_tree_with_sim_preview,
 )
+from rap_demo.storage.runs import save_run
 from rap_demo.visualizer.web.app import create_app, app
 
 
@@ -315,6 +316,43 @@ class TestTreeSerializerContract:
         payload = serialize_tree(node)
 
         assert payload["llm_calls"] == calls
+
+    def test_serialize_tree_includes_reward_components(self) -> None:
+        """Nodes expose r1/r2/r3 next to the combined reward for MCTS metrics."""
+        node = MCTSNode(state="S1", depth=1, reward=0.3, r1=0.2, r2=0.3, r3=0.4)
+
+        payload = serialize_tree(node)
+
+        assert payload["r1"] == 0.2
+        assert payload["r2"] == 0.3
+        assert payload["r3"] == 0.4
+
+    def test_serialize_tree_recovers_components_from_parent_call_log(self) -> None:
+        """Old run files without node fields derive r1/r2/r3 from the parent call log."""
+        root = MCTSNode(state="S0", depth=0)
+        root.llm_calls = [
+            {
+                "phase": "self-evaluation",
+                "action": "Pick up the red block.",
+                "r1": 0.25,
+                "r2": 0.5,
+                "r3": 0.75,
+            }
+        ]
+        child = MCTSNode(
+            state="S1",
+            action="Pick up the red block.",
+            parent=root,
+            depth=1,
+            reward=0.5,
+        )
+        root.children.append(child)
+
+        payload = serialize_tree(root)["children"][0]
+
+        assert payload["r1"] == 0.25
+        assert payload["r2"] == 0.5
+        assert payload["r3"] == 0.75
 
     def test_sim_preview_nodes_expose_llm_trace(self) -> None:
         """Rollout preview nodes carry their trace so the inspector can explain them."""
@@ -888,6 +926,66 @@ class TestVisualizerWebApp:
         assert data["max_iterations"] == 10
         assert isinstance(data["best_path_ids"], list)
         assert len(data["best_path_ids"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_replay_endpoints_load_run_and_walk_it_with_step(
+        self, tmp_path: Any
+    ) -> None:
+        """GET /api/runs + POST /api/replay let the UI replay a saved run with Step."""
+        root = MCTSNode(state="S0", depth=0)
+        child = MCTSNode(
+            state="S1",
+            action="Pick up the red block.",
+            parent=root,
+            depth=1,
+            reward=0.4,
+            r1=0.25,
+            r2=0.5,
+            r3=0.75,
+        )
+        root.add_child(child)
+        saved = save_run(
+            root,
+            runs_dir=tmp_path,
+            iterations=1,
+            goal=["the red block is on top of the blue block"],
+            metrics={"Best Reward": "0.40"},
+        )
+
+        controller = SearchController(mcts=None, initial_state="live", max_iterations=5)
+        app_instance = create_app(controller=controller, runs_dir=tmp_path)
+        transport = ASGITransport(app=app_instance)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            runs_res = await client.get("/api/runs")
+            assert runs_res.status_code == 200
+            runs = runs_res.json()["runs"]
+            assert [run["run_id"] for run in runs] == [saved.stem]
+
+            replay_res = await client.post("/api/replay", json={"ref": saved.stem})
+            assert replay_res.status_code == 200
+            replay = replay_res.json()
+            assert replay["replay"] is True
+            assert replay["iteration"] == 0
+            assert replay["max_iterations"] == 1
+            assert len(replay["best_path_ids"]) == 1
+            assert replay["run"]["run_id"] == saved.stem
+
+            step_res = await client.post("/api/search/step")
+            assert step_res.status_code == 200
+            step = step_res.json()
+            assert step["replay"] is True
+            assert step["iteration"] == 1
+            assert step["status"] == "finished"
+            assert step["state"] is not None
+            assert len(step["best_path_ids"]) == 2
+
+            reset_res = await client.post("/api/search/reset")
+            assert reset_res.status_code == 200
+            assert reset_res.json()["iteration"] == 0
+
+            exit_res = await client.post("/api/replay/exit")
+            assert exit_res.status_code == 200
+            assert exit_res.json()["replay"] is False
 
     @pytest.mark.asyncio
     async def test_step_maps_llm_error_to_502_json_instead_of_500(self) -> None:

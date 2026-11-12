@@ -15,6 +15,30 @@ from rap_demo.llm.base import BaseLLM, LLMConnectionError, LLMError, LLMTimeoutE
 from rap_demo.llm.rate_limiter import TokenRateLimiter, resolve_model_rate_limits
 
 
+# Reasoning models need room for their chain of thought before the final Yes/No.
+# gpt-oss needs ~128 tokens; qwen3.5 needs ~400 before it emits its answer.
+_SELF_EVAL_RETRY_MAX_TOKENS = 512
+# Budget used when the model is asked to propose the next action so that the
+# logprob of the generated action tokens can be read back.
+_ACTION_SCORING_MAX_TOKENS = 512
+# LiteLLM treats the OpenAI-compatible Ollama endpoints as OpenAI and refuses to
+# call them without credentials, even though Ollama ignores the key entirely.
+_OLLAMA_API_KEY = "ollama"
+
+
+def _token_probabilities_are_usable(
+    probabilities: Mapping[str, float],
+    content: str | None,
+) -> bool:
+    """Return True when a Yes/No request produced an answer or a real distribution."""
+    if any(value > 0.0 for value in probabilities.values()):
+        return True
+    # Reasoning models may spend the whole budget thinking: text such as
+    # "Thinking" or a truncated rationale is not a usable final answer, so the
+    # caller retries with a larger budget.
+    return _answer_token_probabilities(content, ("Yes", "No")) is not None
+
+
 def _load_dotenv_file() -> None:
     """Load environment variables from the nearest .env file without overriding shell vars."""
     from dotenv import find_dotenv, load_dotenv
@@ -215,6 +239,52 @@ def _extract_top_logprob_candidates(logprobs: Any) -> dict[str, float]:
     return {}
 
 
+def _extract_logprob_entries(logprobs: Any) -> list[Any]:
+    """Return per-token logprob entries from chat-style or legacy logprobs payloads."""
+    content_lps = _get_field(logprobs, "content")
+    if isinstance(content_lps, Sequence) and not isinstance(content_lps, (str, bytes)):
+        return list(content_lps)
+    return []
+
+
+def _extract_last_answer_candidates(
+    logprobs: Any,
+    tokens: Sequence[str],
+) -> dict[str, float]:
+    """Return the candidate distribution at the last Yes/No token in the response.
+
+    Reasoning models emit their chain of thought first and only then the final
+    answer. Looking at the first generated token (the old behaviour) therefore
+    reads a channel marker such as ``<|channel|>`` instead of the answer. This
+    walks every generated token and keeps the *last* one that matches a candidate.
+    """
+    wanted = {token.strip().casefold() for token in tokens if token.strip()}
+    if not wanted:
+        return {}
+
+    for entry in reversed(_extract_logprob_entries(logprobs)):
+        answer_token = _get_field(entry, "token")
+        if answer_token is None or str(answer_token).strip().casefold() not in wanted:
+            continue
+
+        candidates: dict[str, float] = {}
+        top = _get_field(entry, "top_logprobs")
+        if isinstance(top, Sequence) and not isinstance(top, (str, bytes)):
+            for item in top:
+                tok = _get_field(item, "token")
+                lp = _get_field(item, "logprob")
+                if tok is not None and lp is not None:
+                    candidates[str(tok)] = float(lp)
+
+        answer_logprob = _get_field(entry, "logprob")
+        if answer_logprob is not None:
+            candidates.setdefault(str(answer_token), float(answer_logprob))
+        if candidates:
+            return candidates
+
+    return {}
+
+
 def _match_token_logprob(candidates: Mapping[str, float], token: str) -> float | None:
     """Find logprob for token using exact, leading-space, then stripped matching."""
     if token in candidates:
@@ -230,16 +300,32 @@ def _match_token_logprob(candidates: Mapping[str, float], token: str) -> float |
 
 
 def _answer_token_probabilities(content: str | None, tokens: Sequence[str]) -> dict[str, float] | None:
-    """Convert an explicit leading Yes/No answer to a one-hot fallback."""
+    """Convert an explicit Yes/No answer in the text to a one-hot fallback.
+
+    Uses the last standalone occurrence so a final answer wins over a mention
+    that appeared earlier in the response.
+    """
     if not content:
         return None
-    match = re.match(r"\s*([a-z]+)\b", content, flags=re.IGNORECASE)
-    if match is None:
+
+    lowered = content.casefold()
+    best_position = -1
+    best_answer: str | None = None
+    for token in tokens:
+        needle = token.strip().casefold()
+        if not needle:
+            continue
+        for match in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", lowered):
+            if match.start() > best_position:
+                best_position = match.start()
+                best_answer = needle
+
+    if best_answer is None:
         return None
-    answer = match.group(1).casefold()
-    if answer not in {token.casefold() for token in tokens}:
-        return None
-    return {token: float(token.casefold() == answer) for token in tokens}
+    return {
+        token: float(token.strip().casefold() == best_answer)
+        for token in tokens
+    }
 
 
 class LiteLLMClient(BaseLLM):
@@ -628,9 +714,8 @@ class LiteLLMClient(BaseLLM):
             "echo": True,
             "timeout": self.timeout,
             "api_base": api_base,
+            "api_key": self.api_key or _OLLAMA_API_KEY,
         }
-        if self.api_key is not None:
-            kwargs["api_key"] = self.api_key
         try:
             response = self._invoke_completion(kwargs)
         except Exception as exc:
@@ -678,10 +763,39 @@ class LiteLLMClient(BaseLLM):
 
         Returns the generated text as well, so R3 can log the model's answer from the
         same request instead of issuing a separate generation call.
+
+        Some models are "reasoners" (for example gpt-oss via Ollama): with a
+        one-token budget they only emit a channel marker such as ``<|channel|>``
+        and never reach the Yes/No answer. When that happens the request is retried
+        with a larger budget so the answer and its logprob can be read.
         """
+        probabilities, content = self._score_candidate_tokens(prompt, tokens, max_tokens=1)
+
+        if _token_probabilities_are_usable(probabilities, content):
+            return probabilities, content
+
+        retry_probabilities, retry_content = self._score_candidate_tokens(
+            prompt,
+            tokens,
+            max_tokens=_SELF_EVAL_RETRY_MAX_TOKENS,
+        )
+        if _token_probabilities_are_usable(retry_probabilities, retry_content):
+            return retry_probabilities, retry_content
+        if (retry_content or "").strip() and not (content or "").strip():
+            return retry_probabilities, retry_content
+        return probabilities, content
+
+    def _score_candidate_tokens(
+        self,
+        prompt: str,
+        tokens: Sequence[str],
+        *,
+        max_tokens: int,
+    ) -> tuple[dict[str, float], str | None]:
+        """Issue one logprob request and map it to the requested candidate tokens."""
         kwargs = self._build_completion_kwargs(
             prompt,
-            max_tokens=1,
+            max_tokens=max_tokens,
             temperature=0.0,
             logprobs=True,
             top_logprobs=10,
@@ -689,6 +803,7 @@ class LiteLLMClient(BaseLLM):
         ollama = self._ollama_openai_config()
         if ollama is not None:
             kwargs["model"], kwargs["api_base"] = ollama
+            kwargs["api_key"] = self.api_key or _OLLAMA_API_KEY
         try:
             response = self._invoke_completion(kwargs)
         except Exception as exc:
@@ -697,7 +812,7 @@ class LiteLLMClient(BaseLLM):
 
             fallback_kwargs = self._build_completion_kwargs(
                 prompt,
-                max_tokens=1,
+                max_tokens=max_tokens,
                 temperature=0.0,
             )
             try:
@@ -712,7 +827,10 @@ class LiteLLMClient(BaseLLM):
             return {token: 0.0 for token in tokens}, None
 
         content = _extract_message_content(choice)
-        candidates = _extract_top_logprob_candidates(_get_field(choice, "logprobs"))
+        logprobs = _get_field(choice, "logprobs")
+        candidates = _extract_last_answer_candidates(logprobs, tokens)
+        if not candidates:
+            candidates = _extract_top_logprob_candidates(logprobs)
         if candidates:
             matched = {
                 token: _match_token_logprob(candidates, token)

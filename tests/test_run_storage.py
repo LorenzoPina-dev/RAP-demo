@@ -366,6 +366,37 @@ class TestDeserializeTree:
 
         assert restored.llm_calls == calls
 
+    def test_deserialize_tree_preserves_reward_components(self) -> None:
+        """deserialize_tree restores r1/r2/r3 so replay keeps the inspector breakdown."""
+        node = MCTSNode(
+            state=BlockState(clear={"red"}, on_table={"red"}, on={}, holding=None),
+            depth=1,
+            reward=0.5,
+            r1=0.2,
+            r2=0.4,
+            r3=0.8,
+        )
+
+        restored = deserialize_tree(serialize_tree(node))
+
+        assert restored.r1 == pytest.approx(0.2)
+        assert restored.r2 == pytest.approx(0.4)
+        assert restored.r3 == pytest.approx(0.8)
+
+    def test_serialize_tree_exposes_r1_provenance(self) -> None:
+        """Uniform R1 from providers without logprobs is labelled so the UI can explain it."""
+        node = MCTSNode(
+            state=BlockState(clear={"red"}, on_table={"red"}, on={}, holding=None),
+            depth=1,
+            reward=0.25,
+            llm_trace={"source": "model-paper", "prob": 0.25, "r1_source": "uniform-fallback"},
+        )
+
+        data = serialize_tree(node)
+
+        assert data["r1"] == pytest.approx(0.25)
+        assert data["r1_source"] == "uniform-fallback"
+
     def test_deserialized_tree_works_with_trajectory_extraction_and_console(self) -> None:
         """Restored tree works seamlessly with extract_best_trajectory, MCTS, and RichMCTSConsole."""
         orig_root, _ = _build_sample_tree()

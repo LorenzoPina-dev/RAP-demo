@@ -209,6 +209,13 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
     if cfg is not None and model is None and backend == "litellm" and cfg.default_model:
         model = cfg.default_model
 
+    notices: list[str] = []
+    if model is not None:
+        # Windows shells pass backslashes; provider model IDs use forward slashes.
+        model = model.replace("\\", "/")
+        while "//" in model:
+            model = model.replace("//", "/")
+
     if cfg is not None and model is not None:
         profile = cfg.resolve_model(model)
         if profile is not None:
@@ -227,6 +234,17 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
                 args.mode = profile.mode
             if "iterations" not in explicit_args and profile.iterations is not None:
                 args.iterations = profile.iterations
+        else:
+            # A model was requested but is not a models.json profile. Treat it as a
+            # raw provider model ID instead of silently running MockLLM (which made
+            # the UI report P(Yes)=P(No)=0.5 and uniform r1 values).
+            if "backend" not in explicit_args and backend == "mock":
+                backend = "litellm"
+            notices.append(
+                f"Model '{model}' is not defined in models.json; using backend "
+                f"'{backend}' with default settings. Add a profile to models.json to "
+                "configure api_base, timeout, and rate limits."
+            )
 
     resolved: dict[str, Any] = {
         "backend": backend,
@@ -241,6 +259,8 @@ def _resolve_execution_llm_config(args: argparse.Namespace) -> dict[str, Any]:
         resolved["reasoning_effort"] = reasoning_effort
     if config_path is not None:
         resolved["config_path"] = config_path
+    if notices:
+        resolved["notices"] = notices
     return resolved
 
 
@@ -532,6 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report_llm_notices(err_console: Console, cfg: dict[str, Any]) -> None:
+    """Prints non-fatal LLM configuration warnings and removes them from the kwargs."""
+    for notice in cfg.pop("notices", []):
+        err_console.print(f"[yellow]Warning:[/yellow] {notice}")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Executes terminal MCTS search according to parsed CLI arguments.
 
@@ -574,6 +600,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
         effective_backend = str(resolved_llm_cfg["backend"])
+        _report_llm_notices(err_console, resolved_llm_cfg)
         llm = _create_llm(**resolved_llm_cfg)
         domain = BlocksworldDomain(
             initial_state=initial_state,
@@ -679,6 +706,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
         effective_backend = str(resolved_llm_cfg["backend"])
+        _report_llm_notices(err_console, resolved_llm_cfg)
         llm = _create_llm(**resolved_llm_cfg)
         domain = BlocksworldDomain(
             initial_state=initial_state,
@@ -788,6 +816,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     try:
         resolved_llm_cfg = _resolve_execution_llm_config(args)
         effective_backend = str(resolved_llm_cfg["backend"])
+        _report_llm_notices(err_console, resolved_llm_cfg)
 
         # 1. Execute Hybrid Mode
         llm_hybrid = _create_llm(**resolved_llm_cfg)

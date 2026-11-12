@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Optional
 
 from rap_demo.core.node import MCTSNode
@@ -32,12 +33,96 @@ def _serialize_state(state: Any) -> Any:
 
 
 def _serialize_action(action: Any) -> Optional[str]:
-    """Serializes an action into a string representation or None."""
+    """Serializes an action into canonical text or None.
+
+    Domain actions expose ``to_text()``; using it keeps run files and the UI
+    readable instead of storing a full ``BlockAction(...)`` dataclass repr.
+    """
     if action is None:
         return None
     if isinstance(action, str):
-        return action
+        return _action_label(action)
+    if hasattr(action, "to_text"):
+        try:
+            return str(action.to_text())
+        except Exception:
+            pass
     return str(action)
+
+
+def _action_label(action: Any) -> Optional[str]:
+    """Human-readable action text used to match a node with its parent's call log."""
+    if action is None:
+        return None
+    if hasattr(action, "to_text"):
+        try:
+            return str(action.to_text())
+        except Exception:
+            pass
+
+    text = str(action)
+    # Older run files stored ``str(BlockAction(...))`` instead of canonical
+    # text. Recover the fields so the self-evaluation entry can still be found.
+    if "BlockAction(" in text:
+        kind_match = re.search(
+            r"action_type=(?:<ActionType\.\w+:\s*'([^']+)'>|'([^']+)'|ActionType\.(\w+))",
+            text,
+        )
+        block_match = re.search(r"block='([^']+)'", text)
+        target_match = re.search(r"target=(?:'([^']+)'|None)", text)
+        if kind_match and block_match:
+            kind = next((value for value in kind_match.groups() if value), "").lower()
+            block = block_match.group(1)
+            target = target_match.group(1) if target_match and target_match.group(1) else None
+            if kind == "pick_up":
+                return f"Pick up the {block} block."
+            if kind == "put_down":
+                return f"Put down the {block} block."
+            if kind == "stack" and target:
+                return f"Stack the {block} block on top of the {target} block."
+            if kind == "unstack" and target:
+                return f"Unstack the {block} block from on top of the {target} block."
+
+    return text
+
+
+def _node_reward_components(node: MCTSNode) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return r1/r2/r3 for a node, falling back to its trace and parent call log.
+
+    Run files created before reward components were stored on the node still
+    contain the self-evaluation entry in the parent's LLM call log. Reconstructing
+    the breakdown from there lets replay mode show r1/r2/r3 for old runs too.
+    """
+    r1 = node.r1
+    r2 = node.r2
+    r3 = node.r3
+
+    trace = getattr(node, "llm_trace", None)
+    if isinstance(trace, dict) and r1 is None:
+        raw_prob = trace.get("prob")
+        if raw_prob is not None:
+            try:
+                r1 = float(raw_prob)
+            except (TypeError, ValueError):
+                r1 = None
+
+    parent = getattr(node, "parent", None)
+    if parent is not None and (r1 is None or r2 is None or r3 is None):
+        node_action = _action_label(node.action)
+        for call in reversed(getattr(parent, "llm_calls", None) or []):
+            if call.get("phase") != "self-evaluation":
+                continue
+            if node_action is not None and call.get("action") != node_action:
+                continue
+            if r1 is None and call.get("r1") is not None:
+                r1 = float(call["r1"])
+            if r2 is None and call.get("r2") is not None:
+                r2 = float(call["r2"])
+            if r3 is None and call.get("r3") is not None:
+                r3 = float(call["r3"])
+            break
+
+    return r1, r2, r3
 
 
 def _compute_node_uct(node: MCTSNode) -> Optional[float]:
@@ -73,17 +158,29 @@ def serialize_tree(root_node: MCTSNode) -> dict[str, Any]:
     """
 
     def _serialize_node(node: MCTSNode) -> dict[str, Any]:
+        r1, r2, r3 = _node_reward_components(node)
+        trace = getattr(node, "llm_trace", None)
+        r1_source = None
+        if isinstance(trace, dict):
+            if trace.get("r1_source"):
+                r1_source = str(trace["r1_source"])
+            elif trace.get("prob") is not None:
+                r1_source = "trace"
         return {
             "id": f"node_{id(node)}",
             "state": _serialize_state(node.state),
             "action": _serialize_action(node.action),
             "thought": getattr(node, "thought", None) or (getattr(node.action, "thought", None) if node.action else None),
-            "llm_trace": getattr(node, "llm_trace", None),
+            "llm_trace": trace,
             "llm_calls": list(getattr(node, "llm_calls", None) or []),
             "visits": node.N,
             "Q": _sanitize_float(node.Q, default_inf=0.0) or 0.0,
             "M": _sanitize_float(node.M, default_inf=None),
             "reward": float(node.reward),
+            "r1": _sanitize_float(r1) if r1 is not None else None,
+            "r2": _sanitize_float(r2) if r2 is not None else None,
+            "r3": _sanitize_float(r3) if r3 is not None else None,
+            "r1_source": r1_source,
             "uct": _compute_node_uct(node),
             "is_terminal": bool(node.is_terminal),
             "depth": int(node.depth),

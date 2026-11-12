@@ -19,12 +19,22 @@ class MCTSNode:
         thought: Optional[str] = None,
         llm_trace: Optional[dict[str, Any]] = None,
         llm_calls: Optional[list[dict[str, Any]]] = None,
+        r1: Optional[float] = None,
+        r2: Optional[float] = None,
+        r3: Optional[float] = None,
     ) -> None:
         self.state = state
         self.action = action
         self.parent = parent
         self.depth = depth
         self.reward = float(reward)
+        # Components of the immediate transition reward (RAP Section 4.1):
+        # r1 = action likelihood, r2 = goal progress, r3 = self-evaluation.
+        # They stay optional because old run files and non-paper domains may not
+        # have recorded them.
+        self.r1: Optional[float] = None if r1 is None else float(r1)
+        self.r2: Optional[float] = None if r2 is None else float(r2)
+        self.r3: Optional[float] = None if r3 is None else float(r3)
         self.children: list[MCTSNode] = []
         self.visited: bool = False
         self.is_terminal: bool = is_terminal
@@ -40,6 +50,18 @@ class MCTSNode:
         self.M: float = -math.inf  # Max action value M(s, a)
         # Prior value used by UCT for not-yet-visited children (RAP Appendix A).
         self.prior: float = 1.0
+
+    def set_reward_components(self, components: Optional[dict[str, Any]]) -> None:
+        """Copies r1/r2/r3 from a world-model reward sink when present."""
+        if not components:
+            return
+        for key in ("r1", "r2", "r3"):
+            value = components.get(key)
+            if value is not None:
+                try:
+                    setattr(self, key, float(value))
+                except (TypeError, ValueError):
+                    pass
 
     @property
     def is_leaf(self) -> bool:

@@ -65,6 +65,12 @@ def _build_tree_with_sim_preview(
             "Q": float(sim_node.Q),
             "M": None,
             "reward": float(sim_node.reward),
+            "r1": getattr(sim_node, "r1", None),
+            "r2": getattr(sim_node, "r2", None),
+            "r3": getattr(sim_node, "r3", None),
+            "r1_source": (sim_node.llm_trace or {}).get("r1_source")
+            if isinstance(getattr(sim_node, "llm_trace", None), dict)
+            else None,
             "uct": None,
             "is_terminal": bool(sim_node.is_terminal),
             "depth": int(sim_node.depth),
@@ -383,10 +389,12 @@ class SearchController:
             "max_iterations": self.max_iterations,
             "status": self._status.value,
             "tree": serialize_tree(self._root),
+            "state": _serialize_state(node.state),
             "best_node_id": f"node_{id(node)}",
             "best_path_ids": self.get_best_path_ids(),
             "thought": thought,
             "replay": True,
+            "run": dict(self._replay_meta),
         }
         await self.emit_event("step", payload)
 
@@ -497,6 +505,7 @@ class SearchController:
             "goal": self.goal,
             "mode": self.mode,
             "tree": serialize_tree(self._root),
+            "state": _serialize_state(self.current_state),
             "best_path_ids": self.get_best_path_ids(),
             "replay": self._replay_path is not None,
             "run": dict(self._replay_meta),

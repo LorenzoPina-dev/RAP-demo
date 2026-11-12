@@ -1163,6 +1163,12 @@ svg.tree-svg {
   gap: 6px;
 }
 
+/* Flex children must keep their natural height: letting them shrink clips the
+   expanded "whole path" list instead of scrolling the card. */
+.model-io > * {
+  flex: 0 0 auto;
+}
+
 .io-block {
   border: 1px solid var(--border-subtle);
   border-radius: 5px;

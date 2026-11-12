@@ -227,6 +227,7 @@ class BlocksworldWorldModel(WorldModel):
         action: BlockAction,
         lightweight: bool = False,
         call_log: list[dict[str, Any]] | None = None,
+        reward_sink: dict[str, Any] | None = None,
     ) -> tuple[BlockState, float, bool]:
         """Given current state and action, returns (next_state, immediate_reward, is_terminal).
 
@@ -240,6 +241,8 @@ class BlocksworldWorldModel(WorldModel):
                 paper's "lightweight reward" used during simulation.
             call_log: Optional sink receiving one dict per LLM call, so the
                 inspector can show the exact world-model prompt and response.
+            reward_sink: Optional dict populated with the r1/r2/r3 components
+                and the combined reward for the inspector.
         """
         if self.mode == "hybrid" or lightweight:
             next_state = state.apply_action(action)
@@ -278,26 +281,32 @@ class BlocksworldWorldModel(WorldModel):
 
         goal_reward = calculate_goal_reward(next_state, self.goal)
         is_terminal = goal_reward >= 100.0
+        action_score = _action_likelihood(action)
+        eval_score: float | None = None
 
         if is_terminal:
             # The paper assigns a "super large reward" when every goal condition holds.
             step_reward = goal_reward
         else:
-            action_score = _action_likelihood(action)
             eval_score = 0.5 if not lightweight else None
             if not lightweight and self.llm is not None:
                 eval_prompt = build_self_eval_prompt(state, action, self.goal)
                 p_yes, p_no, eval_response = self_evaluation_result(self.llm, eval_prompt)
-                total = p_yes + p_no
-                eval_score = p_yes / total if total > 0.0 else 0.5
+                # Paper (Section 3.2): R3 is the next-word probability of " Yes",
+                # not a renormalized Yes/No ratio.
+                if p_yes + p_no > 0.0:
+                    eval_score = max(0.0, min(1.0, p_yes))
+                else:
+                    eval_score = 0.5
                 if call_log is not None:
+                    action_trace = getattr(action, "llm_trace", None)
                     call_log.append(
                         {
                             "phase": "self-evaluation",
                             "action": action.to_text(),
                             "prompt": eval_prompt,
                             "response": (
-                                f"Answer: {eval_response.strip() if eval_response else 'unavailable (probability-only scoring)'}\n"
+                                f"Answer: {eval_response.strip() if eval_response else 'unavailable (no Yes/No token returned)'}\n"
                                 f"P(Yes)={p_yes:.6f}, P(No)={p_no:.6f}"
                             ),
                             "logprob": None,
@@ -305,6 +314,9 @@ class BlocksworldWorldModel(WorldModel):
                             "r1": action_score,
                             "r2": goal_reward,
                             "r3": eval_score,
+                            "r1_source": action_trace.get("r1_source")
+                            if isinstance(action_trace, dict)
+                            else None,
                             "p_yes": p_yes,
                             "p_no": p_no,
                             "source": "self-evaluation",
@@ -319,6 +331,16 @@ class BlocksworldWorldModel(WorldModel):
                 action_score=action_score,
                 alpha=self.alpha,
                 eval_score=eval_score,
+            )
+
+        if reward_sink is not None:
+            reward_sink.update(
+                {
+                    "r1": float(action_score),
+                    "r2": float(goal_reward),
+                    "r3": None if eval_score is None else float(eval_score),
+                    "reward": float(step_reward),
+                }
             )
 
         return next_state, float(step_reward), is_terminal

@@ -133,6 +133,7 @@ class BlocksworldAgent(ReasoningAgent):
                 "response": None,
                 "proposed": None,
                 "reason": "Lightweight rollout: action likelihood skipped.",
+                "r1_source": "skipped",
             }
             return [replace(action, llm_trace=dict(trace)) for action in legal_actions]
 
@@ -142,7 +143,17 @@ class BlocksworldAgent(ReasoningAgent):
             logprob = self._action_logprob(prompt, action)
             scored.append((logprob, action))
 
-        probabilities = _softmax([logprob for logprob, _ in scored])
+        logprobs = [logprob for logprob, _ in scored]
+        # Some providers (Ollama's OpenAI-compatible endpoints) cannot return
+        # continuation logprobs. Every action then scores 0.0 and softmax yields
+        # a uniform prior. Label that case so the UI can explain the value.
+        r1_source = (
+            "uniform-fallback"
+            if logprobs and all(logprob == 0.0 for logprob in logprobs)
+            else "logprob"
+        )
+
+        probabilities = _softmax(logprobs)
         ranked = sorted(
             zip(scored, probabilities),
             key=lambda item: item[0][0],
@@ -157,6 +168,7 @@ class BlocksworldAgent(ReasoningAgent):
             "response": None,
             "proposed": None,
             "reason": None,
+            "r1_source": r1_source,
         }
         actions: list[BlockAction] = []
         for (logprob, action), probability in ranked:

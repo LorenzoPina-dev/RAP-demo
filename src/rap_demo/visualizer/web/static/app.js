@@ -643,7 +643,16 @@ class VisualizerApp {
 
   setReplayUi(enabled) {
     this.replayMode = Boolean(enabled);
-    if (this.replayBadge) this.replayBadge.hidden = !this.replayMode;
+    if (this.replayBadge) {
+      this.replayBadge.hidden = !this.replayMode;
+      if (this.replayMode && this.replayMeta && this.replayMeta.run_id) {
+        this.replayBadge.textContent = `replay · ${this.replayMeta.run_id}`;
+        this.replayBadge.title = this.replayMeta.run_id;
+      } else {
+        this.replayBadge.textContent = "replay";
+        this.replayBadge.removeAttribute("title");
+      }
+    }
     if (this.btnEditProblem) this.btnEditProblem.disabled = this.replayMode;
     if (this.btnReplay) this.btnReplay.classList.toggle("active", this.replayMode);
     if (this.btnReplayLive) {
@@ -1007,6 +1016,13 @@ class VisualizerApp {
     this.renderTree();
     this.renderTrajectoryBar();
 
+    // In replay mode the cursor defines the visible step, so follow it even if
+    // auto-follow was disabled during a previous live search.
+    if (this.replayMode) {
+      this.selectNode(this.resolveFollowNode() || this.treeData, false);
+      return;
+    }
+
     if (isReset) {
       this.selectNode(this.treeData, false);
       return;
@@ -1304,6 +1320,9 @@ class VisualizerApp {
         <span>M=${mStr}</span>
         <span>UCT=${uctStr}</span>
         <span>R=${Number(node.reward || 0).toFixed(1)}</span>
+        <span>R1=${node.r1 === null || node.r1 === undefined ? "—" : Number(node.r1).toFixed(2)}</span>
+        <span>R2=${node.r2 === null || node.r2 === undefined ? "—" : Number(node.r2).toFixed(2)}</span>
+        <span>R3=${node.r3 === null || node.r3 === undefined ? "—" : Number(node.r3).toFixed(2)}</span>
       </div>
     `;
     this.treeTooltip.hidden = false;
@@ -1506,6 +1525,13 @@ class VisualizerApp {
     }
 
     if (this.modelIo) {
+      const sameNode = this._modelIoNodeId === node.id;
+      const previousScroll = sameNode ? this.modelIo.scrollTop : 0;
+      const openSummaries = sameNode
+        ? Array.from(this.modelIo.querySelectorAll("details.io-block[open] > summary")).map(
+            (el) => el.textContent
+          )
+        : null;
       if (!trace) {
         this.modelIo.innerHTML = `<p class="empty-hint">${
           node.action
@@ -1558,6 +1584,15 @@ class VisualizerApp {
           ${proposed}
         `;
       }
+
+      if (sameNode && openSummaries) {
+        this.modelIo.querySelectorAll("details.io-block").forEach((details) => {
+          const summary = details.querySelector(":scope > summary");
+          if (summary) details.open = openSummaries.includes(summary.textContent);
+        });
+        this.modelIo.scrollTop = previousScroll;
+      }
+      this._modelIoNodeId = node.id;
     }
 
     // 1c. All LLM calls made while expanding this node, plus the whole path
@@ -1592,7 +1627,8 @@ class VisualizerApp {
       }
       const r1 = call.r1 ?? call.prob;
       if (r1 !== undefined && r1 !== null) {
-        meta.push(`r1 ${Number(r1).toFixed(3)}`);
+        const r1Suffix = call.r1_source === "uniform-fallback" ? " (uniform)" : "";
+        meta.push(`r1 ${Number(r1).toFixed(3)}${r1Suffix}`);
       }
       if (call.r2 !== undefined && call.r2 !== null) meta.push(`r2 ${Number(call.r2).toFixed(3)}`);
       if (call.r3 !== undefined && call.r3 !== null) meta.push(`r3 ${Number(call.r3).toFixed(3)}`);
@@ -1609,11 +1645,20 @@ class VisualizerApp {
       const errorHtml = call.error
         ? `<p class="trace-warning">${this.escapeHtml(call.error)}</p>`
         : "";
+      const staleSelfEval =
+        call.phase === "self-evaluation" &&
+        !call.response &&
+        Number(call.p_yes ?? 0) === 0 &&
+        Number(call.p_no ?? 0) === 0;
+      const staleSelfEvalHtml = staleSelfEval
+        ? `<p class="trace-warning">Recorded with a one-token budget: the model never emitted its Yes/No token, so P(Yes) and P(No) are both 0. Rerun the search to capture a real self-evaluation.</p>`
+        : "";
       const responseLabel = call.phase === "action-scoring" ? "Scored continuation" : "Response";
       return `<details class="io-block call-block${call.error ? " call-error" : ""}" ${openDefault ? "open" : ""}>
         <summary>#${idx + 1} ${this.escapeHtml(phase)}${this.escapeHtml(actionLabel)}</summary>
         ${metaHtml}
         ${errorHtml}
+        ${staleSelfEvalHtml}
         <div class="live-section-label">Prompt</div>
         <pre class="io-pre">${this.escapeHtml(call.prompt || "(not recorded)")}</pre>
         <div class="live-section-label">${responseLabel}</div>
@@ -1629,6 +1674,17 @@ class VisualizerApp {
     }
 
     if (this.llmCalls) {
+      // SSE updates re-render this panel on every phase event. Preserve the
+      // user's scroll position and which call blocks are expanded when the
+      // selected node has not changed.
+      const sameNode = this._llmCallsNodeId === node.id;
+      const previousScroll = sameNode ? this.llmCalls.scrollTop : 0;
+      const openSummaries = sameNode
+        ? Array.from(this.llmCalls.querySelectorAll("details.io-block[open] > summary")).map(
+            (el) => el.textContent
+          )
+        : null;
+
       const stepHtml = llmCalls.length
         ? llmCalls.map((call, idx) => renderCall(call, idx, idx === 0)).join("")
         : `<p class="empty-hint">${
@@ -1656,25 +1712,48 @@ class VisualizerApp {
         ${stepHtml}
         ${pathHtml}
       `;
+
+      if (sameNode && openSummaries) {
+        this.llmCalls.querySelectorAll("details.io-block").forEach((details) => {
+          const summary = details.querySelector(":scope > summary");
+          if (summary) details.open = openSummaries.includes(summary.textContent);
+        });
+        this.llmCalls.scrollTop = previousScroll;
+      }
+      this._llmCallsNodeId = node.id;
     }
 
     // 2. Metrics Overview + Raw JSON
     if (this.metricsOverview) {
       const fmt = (v, digits = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(digits));
+      const r1Uniform = node.r1_source === "uniform-fallback";
       const items = [
-        ["Visits", String(node.visits ?? 0)],
-        ["Mean Q", fmt(node.Q)],
-        ["Max M", fmt(node.M)],
-        ["Reward", fmt(node.reward, 1)],
-        ["UCT", fmt(node.uct)],
-        ["Depth", String(node.depth ?? 0)],
-        ["Terminal", node.is_terminal ? "Yes" : "No"],
-        ["Children", String((node.children || []).length)],
+        ["Visits", String(node.visits ?? 0), "Visit count N(s)."],
+        ["Mean Q", fmt(node.Q), "Mean action value Q(s, a)."],
+        ["Max M", fmt(node.M), "Maximum value seen from this state."],
+        ["Reward", fmt(node.reward, 1), "Immediate transition reward."],
+        [
+          r1Uniform ? "R1 · action (uniform)" : "R1 · action",
+          fmt(node.r1, 3),
+          r1Uniform
+            ? "The provider did not expose action logprobs, so every legal action shares the same prior; R1 is uniform."
+            : "R1 = likelihood of the action, as a softmax probability over legal actions.",
+        ],
+        [
+          "R2 · goal (deterministic)",
+          fmt(node.r2, 3),
+          "R2 = fraction of goal conditions satisfied by the predicted next state. Computed by rule, not by a model (100 = all conditions met).",
+        ],
+        ["R3 · self-eval", fmt(node.r3, 3), "R3 = P(\" Yes\") for the self-evaluation question."],
+        ["UCT", fmt(node.uct), "Upper confidence bound used to select the child."],
+        ["Depth", String(node.depth ?? 0), "Distance from the root."],
+        ["Terminal", node.is_terminal ? "Yes" : "No", "Whether the state satisfies the goal."],
+        ["Children", String((node.children || []).length), "Number of expanded actions."],
       ];
       this.metricsOverview.innerHTML = items
         .map(
-          ([label, val]) => `
-            <div class="kpi-cell">
+          ([label, val, title]) => `
+            <div class="kpi-cell"${title ? ` title="${this.escapeHtml(title)}"` : ""}>
               <span class="kpi-label">${label}</span>
               <span class="kpi-val">${this.escapeHtml(val)}</span>
             </div>
@@ -1695,6 +1774,9 @@ class VisualizerApp {
           Q: node.Q,
           M: node.M,
           reward: node.reward,
+          r1: node.r1,
+          r2: node.r2,
+          r3: node.r3,
           uct: node.uct,
           is_terminal: node.is_terminal,
           depth: node.depth,
