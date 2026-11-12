@@ -69,6 +69,16 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
             matched_any = True
             continue
 
+        # 3b. A concise equivalent often returned by models: "X is in the hand".
+        m = re.search(r"the\s+(\w+)\s+block\s+is\s+(?:now\s+)?in\s+the\s+hand", c_lower)
+        if m:
+            b = m.group(1)
+            new_on_table.discard(b)
+            new_on.pop(b, None)
+            new_holding = b
+            matched_any = True
+            continue
+
         # 4. Block was in hand and now on table
         m = re.search(r"the\s+(\w+)\s+block\s+was\s+in\s+the\s+hand\s+and\s+now\s+is\s+on\s+the\s+table", c_lower)
         if m:
@@ -118,14 +128,28 @@ def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
             matched_any = True
             continue
 
-        # 8. Block is no longer clear
+        # 8. Block is no longer covered by another block, which frees it up.
+        m = re.search(
+            r"the\s+(\w+)\s+block\s+is\s+no\s+longer\s+(?:covered\s+by|on\s+top\s+of)\s+the\s+(\w+)\s+block",
+            c_lower,
+        )
+        if m:
+            top, bottom = m.group(1), m.group(2)
+            if new_on.get(top) == bottom:
+                del new_on[top]
+            # The same clause often states the resulting state as well.
+            if re.search(r"and\s+now\s+is\s+clear", c_lower):
+                new_clear.add(top)
+            matched_any = True
+            continue
+
+        # 9. Block is no longer clear
         m = re.search(r"the\s+(\w+)\s+block\s+is\s+no\s+longer\s+clear", c_lower)
         if m:
             new_clear.discard(m.group(1))
             matched_any = True
             continue
-
-        # 9. Block is now clear
+        # 10. Block is now clear
         m = re.search(r"the\s+(\w+)\s+block\s+is\s+(?:now\s+)?clear", c_lower)
         if m:
             new_clear.add(m.group(1))

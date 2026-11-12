@@ -652,13 +652,13 @@ class TestBlocksworldRewards:
             (
                 BlockState(clear={"red", "blue"}, on_table={"red", "blue"}),
                 ["the red block is on top of the blue block", "the orange block is on top of the red block"],
-                0.0,
+                0.5,
             ),
             # 1 of 2 conditions met (partial)
             (
                 BlockState(clear={"red"}, on_table={"blue"}, on={"red": "blue"}),
                 ["the red block is on top of the blue block", "the orange block is on top of the red block"],
-                0.5,
+                1.0,
             ),
             # 2 of 2 conditions met (full completion -> bonus >= 100)
             (
@@ -704,19 +704,58 @@ class TestBlocksworldRewards:
         )
         assert r_balanced > 0.0
 
-    def test_calculate_combined_reward_averages_r1_r2_r3(self) -> None:
+    def test_calculate_combined_reward_uses_weighted_geometric_mean(self) -> None:
+        """The reference implementation combines rewards with a geometric mean."""
         state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
         action = BlockAction(ActionType.PICK_UP, "red")
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
 
         reward = calculate_combined_reward(
             state,
             action,
             ["the red block is on top of the blue block"],
             action_score=0.25,
-            eval_score=0.75,
+            alpha=0.5,
         )
 
-        assert math.isclose(reward, (0.25 + 0.0 + 0.75) / 3)
+        expected = 0.25**0.5 * goal_score**0.5
+        assert math.isclose(reward, expected, rel_tol=1e-6)
+
+    def test_calculate_combined_reward_multiplies_self_evaluation(self) -> None:
+        """R3 enters the geometric mean with its own (normalized) exponent."""
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red")
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
+
+        reward = calculate_combined_reward(
+            state,
+            action,
+            ["the red block is on top of the blue block"],
+            action_score=0.25,
+            alpha=0.5,
+            eval_score=0.75,
+            self_eval_weight=0.25,
+        )
+
+        # Weights (0.5, 0.5, 0.25) are normalized to (0.4, 0.4, 0.2).
+        expected = 0.25**0.4 * goal_score**0.4 * 0.75**0.2
+        assert math.isclose(reward, expected, rel_tol=1e-6)
+
+    def test_calculate_combined_reward_normalizes_weights(self) -> None:
+        """The weights of the three rewards always sum to one."""
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red")
+        goal = ["the red block is on top of the blue block"]
+        goal_score = calculate_goal_reward(state, goal)
+
+        without_r3 = calculate_combined_reward(state, action, goal, action_score=0.25, alpha=0.5)
+        with_r3 = calculate_combined_reward(
+            state, action, goal, action_score=0.25, alpha=0.5, eval_score=0.8
+        )
+
+        # R1 and R2 keep their relative ratio, R3 is added on top.
+        assert math.isclose(without_r3, 0.25**0.5 * goal_score**0.5, rel_tol=1e-6)
+        assert math.isclose(with_r3, 0.25**0.4 * goal_score**0.4 * 0.8**0.2, rel_tol=1e-6)
 
     def test_chained_goal_requires_every_stack_relation(self) -> None:
         goal = "the green block is on top of the orange block is on top of the blue block"
@@ -731,7 +770,7 @@ class TestBlocksworldRewards:
             on={"green": "orange", "orange": "blue"},
         )
 
-        assert calculate_goal_reward(partial_state, goal) == 0.5
+        assert calculate_goal_reward(partial_state, goal) == 1.0
         assert calculate_goal_reward(complete_state, goal) == 100.0
 
     def test_build_self_eval_prompt(self, instance_5_state: BlockState) -> None:
@@ -764,7 +803,8 @@ class TestBlocksworldRewards:
 
         reward = reward_fn(state, action, action_score=0.25)
 
-        assert math.isclose(reward, (0.25 + 0.0 + 0.8) / 3)
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
+        assert math.isclose(reward, 0.25**0.4 * goal_score**0.4 * 0.8**0.2, rel_tol=1e-6)
         assert mock_llm.call_count == 1
 
 
@@ -896,9 +936,9 @@ class TestBlocksworldAgent:
         mock_llm = MockLLM(
             default_response="Pick up the red block.",
             logprobs={
-                "Pick up the red block.": -0.1,
-                "Pick up the blue block.": -1.5,
-                "Unstack the orange block from on top of the yellow block.": -0.8,
+                "pick up the red block": -0.1,
+                "pick up the blue block": -1.5,
+                "unstack the orange block from on top of the yellow block": -0.8,
             },
         )
         agent = BlocksworldAgent(
@@ -912,6 +952,61 @@ class TestBlocksworldAgent:
         assert all(isinstance(a, BlockAction) for a in actions)
         # Should contain legal actions from state
         assert any(a.block == "red" and a.action_type in (ActionType.PICK_UP, "pick_up") for a in actions)
+        # The action likelihood comes from the model and ranks the actions.
+        assert all(action.llm_trace["r1_source"] == "logprob" for action in actions)
+        assert actions[0].llm_trace["logprob"] == max(
+            action.llm_trace["logprob"] for action in actions
+        )
+        assert math.isclose(sum(action.llm_trace["prob"] for action in actions), 1.0)
+
+    def test_agent_paper_mode_scores_the_whole_action_space_in_one_call(
+        self, instance_5_state: BlockState
+    ) -> None:
+        """Paper mode uses the batch teacher-forcing scorer when it is available."""
+        mock_llm = MockLLM(
+            default_response="Pick up the red block.",
+            logprobs={
+                "pick up the red block": -0.1,
+                "pick up the orange block": -1.5,
+                "unstack the blue block from on top of the yellow block": -0.8,
+            },
+        )
+        agent = BlocksworldAgent(
+            llm=mock_llm,
+            goal="the blue block is on top of the orange block and the yellow block is on top of the red block",
+            mode="paper",
+        )
+
+        actions = agent.get_actions(instance_5_state)
+
+        scoring_calls = [call for call in mock_llm.calls if call.method == "score_continuations"]
+        assert len(scoring_calls) == 1
+        assert set(scoring_calls[0].args["targets"]) == {
+            action.to_paper_text() for action in actions
+        }
+        # The scores are model-derived, so the prior is not uniform.
+        assert all(action.llm_trace["r1_source"] == "logprob" for action in actions)
+        assert any(action.llm_trace["prob"] != actions[0].llm_trace["prob"] for action in actions)
+        # The most likely action is ranked first.
+        assert actions[0].llm_trace["logprob"] == max(
+            action.llm_trace["logprob"] for action in actions
+        )
+
+    def test_agent_paper_mode_marks_a_uniform_prior(
+        self, instance_5_state: BlockState
+    ) -> None:
+        """A backend without logprobs yields a uniform prior, labelled as such."""
+        mock_llm = MockLLM(default_response="Pick up the red block.")
+        agent = BlocksworldAgent(
+            llm=mock_llm,
+            goal="the red block is on top of the blue block",
+            mode="paper",
+        )
+
+        actions = agent.get_actions(instance_5_state)
+
+        assert all(action.llm_trace["r1_source"] == "uniform-fallback" for action in actions)
+        assert math.isclose(sum(action.llm_trace["prob"] for action in actions), 1.0)
 
 
 # ============================================================================
@@ -960,7 +1055,9 @@ class TestBlocksworldWorldModel:
 
         assert next_state.holding == "red"
         assert not is_terminal
-        assert math.isclose(reward, (0.25 + 0.0 + 0.8) / 3)
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
+        expected = 0.25**0.4 * goal_score**0.4 * 0.8**0.2
+        assert math.isclose(reward, expected, rel_tol=1e-6)
         assert call_log[-1]["phase"] == "self-evaluation"
         assert call_log[-1]["p_yes"] == 0.8
         assert call_log[-1]["p_no"] == 0.2
@@ -982,7 +1079,8 @@ class TestBlocksworldWorldModel:
         _, reward, _ = world_model.step(state, action, reward_sink=reward_sink)
 
         assert reward_sink["r3"] == pytest.approx(0.8)
-        assert reward == pytest.approx((0.25 + 0.0 + 0.8) / 3)
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
+        assert reward == pytest.approx(0.25**0.4 * goal_score**0.4 * 0.8**0.2)
 
     def test_world_model_uses_neutral_r3_when_probabilities_are_missing(self) -> None:
         state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
@@ -998,7 +1096,8 @@ class TestBlocksworldWorldModel:
         _, reward, _ = world_model.step(state, action, call_log=call_log)
 
         assert call_log[-1]["r3"] == 0.5
-        assert math.isclose(reward, (0.25 + 0.0 + 0.5) / 3)
+        goal_score = calculate_goal_reward(state, ["the red block is on top of the blue block"])
+        assert math.isclose(reward, 0.25**0.4 * goal_score**0.4 * 0.5**0.2, rel_tol=1e-6)
 
     def test_world_model_fills_reward_sink_with_r1_r2_r3(self) -> None:
         """The optional reward sink exposes the breakdown shown in MCTS metrics."""
@@ -1019,7 +1118,7 @@ class TestBlocksworldWorldModel:
         _, reward, _ = world_model.step(state, action, reward_sink=reward_sink)
 
         assert reward_sink["r1"] == 0.25
-        assert reward_sink["r2"] == 0.0
+        assert reward_sink["r2"] == 0.5
         assert reward_sink["r3"] == 0.8
         assert math.isclose(reward_sink["reward"], reward)
 
@@ -1121,6 +1220,32 @@ class TestBlocksworldWorldModel:
         assert next_state.on == {"red": "blue", "orange": "yellow"}
         assert next_state.clear == {"red", "orange"}
         assert next_state.on_table == {"blue", "yellow"}
+
+    def test_world_model_accepts_no_longer_covered_by_clause(self) -> None:
+        """Models phrase "unstacked" as "no longer covered by", sometimes with the new state."""
+        state = BlockState(
+            clear={"blue", "orange", "red"},
+            on_table={"orange", "red", "yellow"},
+            on={"blue": "yellow"},
+            holding=None,
+        )
+        change = (
+            "[CHANGE] the yellow block is no longer covered by the blue block and now is clear, "
+            "and the blue block is in the hand."
+        )
+        mock_llm = MockLLM(default_response=change)
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        action = BlockAction(ActionType.UNSTACK, "blue", "yellow")
+
+        next_state, _, _ = world_model.step(state, action)
+
+        assert "blue" not in next_state.on
+        assert next_state.holding == "blue"
+        assert "yellow" in next_state.clear
 
     def test_world_model_accepts_concise_stack_change(self) -> None:
         state = BlockState(

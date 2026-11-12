@@ -13,6 +13,7 @@ from typing import Any
 
 from rap_demo.llm.base import BaseLLM, LLMConnectionError, LLMError, LLMTimeoutError
 from rap_demo.llm.rate_limiter import TokenRateLimiter, resolve_model_rate_limits
+from rap_demo.llm.teacher_forcing import OllamaChatScorer
 
 
 # Reasoning models need room for their chain of thought before the final Yes/No.
@@ -744,6 +745,53 @@ class LiteLLMClient(BaseLLM):
             if offset is not None and int(offset) >= len(prompt) and lp is not None
         ]
         return float(sum(target_logprobs)) if target_logprobs else 0.0
+
+    def score_continuations(
+        self,
+        prompt: str,
+        targets: Sequence[str],
+        *,
+        assistant_prefix: str = "",
+    ) -> dict[str, float] | None:
+        """Score several continuations with teacher forcing.
+
+        Ollama's OpenAI-compatible ``/v1/completions`` endpoint silently drops
+        the ``echo`` and ``logprobs`` parameters, so R1 would be uniform there.
+        The chat endpoint does report the distribution of the next token, which
+        is enough to score an arbitrary continuation token by token.
+
+        Args:
+            prompt: The prompt the continuations are scored against.
+            targets: Candidate continuations to score.
+            assistant_prefix: Context the continuations are appended to inside
+                the assistant turn. It is not part of the scored text.
+
+        Returns:
+            Mapping of continuation to summed log probability, or None when the
+            backend cannot score arbitrary continuations.
+        """
+        scorer = self._ollama_scorer()
+        if scorer is None:
+            return None
+        try:
+            return scorer.score(prompt, list(targets), assistant_prefix=assistant_prefix)
+        except OSError as exc:
+            print(
+                f"[LiteLLM] Teacher-forcing scoring failed on {self.model}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+    def _ollama_scorer(self) -> OllamaChatScorer | None:
+        """Return a teacher-forcing scorer when this client talks to Ollama."""
+        if not self.model.lower().startswith("ollama/"):
+            return None
+        return OllamaChatScorer.from_model_name(
+            self.model,
+            base_url=self.api_base or "http://localhost:11434",
+            timeout=self.timeout,
+        )
 
     def get_token_probability(self, prompt: str, token: str) -> float:
         """Return one candidate probability using the shared multi-token request."""

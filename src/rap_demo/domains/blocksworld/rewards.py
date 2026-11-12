@@ -62,7 +62,17 @@ def _split_goal_text(text: str) -> list[str]:
 
 
 def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, str] | str) -> float:
-    """Calculates goal heuristic reward: fraction of satisfied conditions (+100 bonus on full satisfaction)."""
+    """Calculates the task-specific goal heuristic R2 (RAP Section 4.1).
+
+    R2 compares the predicted next state with the goal conditions and scales with
+    the number of conditions met. When every condition holds, R2 becomes the
+    "super large reward" that makes the plan win (paper Section 4.1).
+
+    The reference implementation (rap/blocksworld_mcts.py, ``r1_fn``) returns
+    ``sum(meetings) / len(meetings) + 0.5`` for partial progress and ``100`` for
+    a complete goal. The ``+ 0.5`` offset keeps R2 strictly positive, which the
+    weighted geometric mean combination requires.
+    """
     conditions: list[str] = []
 
     if isinstance(goals, str):
@@ -83,7 +93,7 @@ def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, st
 
     if satisfied == total:
         return 100.0
-    return float(satisfied) / float(total)
+    return float(satisfied) / float(total) + 0.5
 
 
 def calculate_combined_reward(
@@ -93,12 +103,34 @@ def calculate_combined_reward(
     action_score: float = 1.0,
     alpha: float = 0.5,
     eval_score: float | None = None,
+    self_eval_weight: float = 0.25,
 ) -> float:
-    """Combine R1/R2 and, when available, R3 for a non-terminal transition."""
+    """Combine R1/R2 and, when available, R3 into the transition reward.
+
+    The reference implementation combines rewards with a *weighted geometric
+    mean* (rap/blocksworld_mcts.py: ``_r0 ** r_alpha * _r1 ** (1 - r_alpha)``),
+    and the paper uses the same form for the math domain (Section 4.2:
+    ``rt = r_t,1 ** alpha * r_t,2 ** (1 - alpha)``). ``alpha`` therefore
+    weights R1 (action likelihood) against R2 (goal heuristic).
+
+    R3 (self-evaluation) is the optional third reward of the ablation in
+    Table 5. The paper reports that adding it helps (0.88 -> 0.91) but does
+    not give a three-way formula, so its raw weight is ``self_eval_weight``
+    and all weights are normalized to sum to one.
+    """
     goal_score = calculate_goal_reward(state, goals)
-    if eval_score is not None:
-        return float((action_score + goal_score + eval_score) / 3.0)
-    return float(alpha * action_score + (1.0 - alpha) * goal_score)
+    components: list[tuple[float, float]] = [
+        (float(action_score), float(alpha)),
+        (float(goal_score), float(1.0 - alpha)),
+    ]
+    if eval_score is not None and self_eval_weight > 0.0:
+        components.append((float(eval_score), float(self_eval_weight)))
+
+    total_weight = sum(weight for _, weight in components)
+    reward = 1.0
+    for value, weight in components:
+        reward *= value ** (weight / total_weight)
+    return reward
 
 
 def self_evaluation_result(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
+from collections.abc import Sequence
 from typing import Any, Pattern
 from rap_demo.llm.base import BaseLLM, LLMError
 
@@ -173,6 +174,44 @@ class MockLLM(BaseLLM):
         if target in self.logprobs:
             return float(self.logprobs[target])
         return float(self.default_logprob)
+
+    def score_continuations(
+        self,
+        prompt: str,
+        targets: Sequence[str],
+        *,
+        assistant_prefix: str = "",
+    ) -> dict[str, float]:
+        """Return configured log probabilities for every continuation.
+
+        Args:
+            prompt: The prompt the continuations are scored against.
+            targets: Candidate continuations.
+            assistant_prefix: Context the continuations are appended to inside
+                the assistant turn. It is not part of the scored text.
+
+        Returns:
+            Mapping of continuation to its configured log probability.
+        """
+        self._calls.append(
+            LLMCall(
+                method="score_continuations",
+                prompt=prompt,
+                args={
+                    "targets": list(targets),
+                    "assistant_prefix": assistant_prefix,
+                },
+            )
+        )
+        scores: dict[str, float] = {}
+        for target in targets:
+            if (prompt, target) in self.logprobs:
+                scores[target] = float(self.logprobs[(prompt, target)])
+            elif target in self.logprobs:
+                scores[target] = float(self.logprobs[target])
+            else:
+                scores[target] = float(self.default_logprob)
+        return scores
 
     def get_token_probability(self, prompt: str, token: str) -> float:
         """Return configured probability in [0.0, 1.0] for (prompt, token) or token.

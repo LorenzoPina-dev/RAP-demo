@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 
@@ -15,6 +16,38 @@ class LLMConnectionError(LLMError):
 
 class LLMTimeoutError(LLMError):
     """Raised when LLM backend request exceeds configured timeout."""
+
+
+@runtime_checkable
+class ContinuationScorer(Protocol):
+    """Optional capability: score several continuations in one batch.
+
+    The RAP paper defines R1 as the log probability of the action continuation
+    given the current state. Backends that can report token-level logprobs
+    implement this protocol so the whole action space can be scored with one
+    teacher-forcing pass per token instead of one request per action.
+    """
+
+    def score_continuations(
+        self,
+        prompt: str,
+        targets: Sequence[str],
+        *,
+        assistant_prefix: str = "",
+    ) -> dict[str, float] | None:
+        """Score every continuation of ``prompt``.
+
+        Args:
+            prompt: The prompt the continuations are scored against.
+            targets: Candidate continuations to score.
+            assistant_prefix: Context the continuations are appended to inside
+                the assistant turn. It is not part of the scored text.
+
+        Returns:
+            Mapping of continuation to its summed log probability, or None when
+            the backend cannot score arbitrary continuations.
+        """
+        ...
 
 
 @runtime_checkable

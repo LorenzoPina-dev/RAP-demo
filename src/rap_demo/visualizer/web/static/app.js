@@ -1742,7 +1742,7 @@ class VisualizerApp {
         [
           "R2 · goal (deterministic)",
           fmt(node.r2, 3),
-          "R2 = fraction of goal conditions satisfied by the predicted next state. Computed by rule, not by a model (100 = all conditions met).",
+          "R2 = goal heuristic: conditions met / conditions total, plus a 0.5 offset (100 when every condition holds). Computed by rule, not by a model.",
         ],
         ["R3 · self-eval", fmt(node.r3, 3), "R3 = P(\" Yes\") for the self-evaluation question."],
         ["UCT", fmt(node.uct), "Upper confidence bound used to select the child."],

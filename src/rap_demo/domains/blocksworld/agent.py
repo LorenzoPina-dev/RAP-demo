@@ -21,8 +21,12 @@ from typing import Any, Sequence
 
 from rap_demo.core.mcts import ReasoningAgent
 from rap_demo.domains.blocksworld.models import ActionType, BlockAction, BlockState, HybridActionProposal
-from rap_demo.domains.blocksworld.prompts import build_hybrid_action_prompt, build_paper_action_prompt
-from rap_demo.llm.base import BaseLLM
+from rap_demo.domains.blocksworld.prompts import (
+    build_hybrid_action_prompt,
+    build_paper_action_prompt,
+    split_paper_plan_prompt,
+)
+from rap_demo.llm.base import BaseLLM, ContinuationScorer
 
 
 def _extract_json_payload(text: str) -> dict[str, Any] | None:
@@ -138,22 +142,9 @@ class BlocksworldAgent(ReasoningAgent):
             return [replace(action, llm_trace=dict(trace)) for action in legal_actions]
 
         prompt = build_paper_action_prompt(state, self.goal, remaining_steps=remaining_steps)
-        scored: list[tuple[float, BlockAction]] = []
-        for action in legal_actions:
-            logprob = self._action_logprob(prompt, action)
-            scored.append((logprob, action))
+        scored, r1_source = self._score_actions(prompt, legal_actions)
 
-        logprobs = [logprob for logprob, _ in scored]
-        # Some providers (Ollama's OpenAI-compatible endpoints) cannot return
-        # continuation logprobs. Every action then scores 0.0 and softmax yields
-        # a uniform prior. Label that case so the UI can explain the value.
-        r1_source = (
-            "uniform-fallback"
-            if logprobs and all(logprob == 0.0 for logprob in logprobs)
-            else "logprob"
-        )
-
-        probabilities = _softmax(logprobs)
+        probabilities = _softmax([logprob for logprob, _ in scored])
         ranked = sorted(
             zip(scored, probabilities),
             key=lambda item: item[0][0],
@@ -182,6 +173,44 @@ class BlocksworldAgent(ReasoningAgent):
         if self.num_candidates is not None:
             actions = actions[: self.num_candidates]
         return actions
+
+    def _score_actions(
+        self,
+        prompt: str,
+        actions: Sequence[BlockAction],
+    ) -> tuple[list[tuple[float, BlockAction]], str]:
+        """Return the r1 score of every action and the source of those scores.
+
+        The paper's r1 is log P(action | state). Backends able to report
+        token-level logprobs score the whole action space in one teacher-forcing
+        pass, which is what the reference implementation does.
+
+        Some providers (Ollama's OpenAI-compatible endpoints) cannot return
+        continuation logprobs. Every action then scores 0.0 and softmax yields
+        a uniform prior. Label that case so the UI can explain the value.
+        """
+        texts = [action.to_paper_text() for action in actions]
+        if isinstance(self.llm, ContinuationScorer):
+            context, marker = split_paper_plan_prompt(prompt)
+            try:
+                scores = self.llm.score_continuations(context, texts, assistant_prefix=marker)
+            except Exception:
+                scores = None
+            if scores:
+                values = [float(scores.get(text, 0.0)) for text in texts]
+                source = "uniform-fallback" if all(value == 0.0 for value in values) else "logprob"
+                return (
+                    list(zip(values, actions)),
+                    source,
+                )
+
+        logprobs = [self._action_logprob(prompt, action) for action in actions]
+        source = (
+            "uniform-fallback"
+            if logprobs and all(logprob == 0.0 for logprob in logprobs)
+            else "logprob"
+        )
+        return list(zip(logprobs, actions)), source
 
     def _action_logprob(self, prompt: str, action: BlockAction) -> float:
         """Returns r1 for one action, degrading to a uniform score if the backend cannot score."""

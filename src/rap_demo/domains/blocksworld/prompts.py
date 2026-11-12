@@ -37,6 +37,10 @@ JSON format:
 # Paper, Appendix C.1: shared instruction block
 # ---------------------------------------------------------------------------
 
+# The marker the action prompt ends with. The action is scored as the
+# continuation that follows it.
+PAPER_PLAN_MARKER = "[PLAN]\n"
+
 BLOCKSWORLD_RULES = """I am playing with a set of blocks where I need to arrange the blocks into stacks. Here are the actions I can do
 
 Pick up a block
@@ -255,6 +259,26 @@ def build_paper_action_prompt(
         ]
     )
     return "\n".join(blocks)
+
+
+def split_paper_plan_prompt(prompt: str) -> tuple[str, str]:
+    """Split the action prompt into its context and the plan marker.
+
+    The paper scores an action as the continuation of the prompt, which ends
+    with the ``[PLAN]`` marker. A chat backend continues the action in the
+    assistant turn instead, so the marker is handed over as the assistant-side
+    context and removed from the prompt to avoid repeating it.
+
+    Args:
+        prompt: The action-likelihood prompt.
+
+    Returns:
+        The prompt without the marker and the marker itself (empty if absent).
+    """
+    head, marker, _ = prompt.rpartition(PAPER_PLAN_MARKER)
+    if not marker:
+        return prompt, ""
+    return head, marker
 
 
 def build_world_update_prompt(state: BlockState, action: BlockAction) -> str:

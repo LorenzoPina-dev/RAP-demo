@@ -477,6 +477,11 @@ class MCTS:
         describe the update as the average reward of future steps, so Q is kept
         as a running average; ``M`` stores the maximum return for the
         alternative "max" selection criterion.
+
+        The per-visit value is the mean of the rewards of the future steps of
+        the node, as the paper describes it. The reference implementation
+        divides the same sum by one more than the number of steps, which
+        includes a phantom zero step in the average.
         """
         reward = rollout_reward
         coeff = 0
