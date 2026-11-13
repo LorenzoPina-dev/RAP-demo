@@ -1221,6 +1221,83 @@ class TestBlocksworldWorldModel:
         assert next_state.clear == {"red", "orange"}
         assert next_state.on_table == {"blue", "yellow"}
 
+    def test_world_model_retries_greedily_when_the_change_is_unusable(self) -> None:
+        """A sampled answer without a [CHANGE] description is retried once."""
+        responses = [
+            "The user wants me to complete the scenario.",
+            (
+                "[CHANGE] the hand was empty and now is holding the red block, "
+                "the red block was on the table and now is in the hand, "
+                "and the red block is no longer clear."
+            ),
+        ]
+        temperatures: list[float] = []
+
+        class _RetryingLLM(MockLLM):
+            def generate(self, prompt: str, **kwargs: Any) -> str:
+                temperatures.append(float(kwargs.get("temperature", 0.0)))
+                return responses.pop(0)
+
+        mock_llm = _RetryingLLM(default_response="")
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+
+        next_state, _, _ = world_model.step(state, BlockAction(ActionType.PICK_UP, "red"))
+
+        assert next_state.holding == "red"
+        assert temperatures == [0.8, 0.0]
+
+    def test_world_model_caps_the_reasoning_effort(self) -> None:
+        """The state update is a one-sentence task, so the effort stays low.
+
+        gpt-oss at high effort explains the prompt instead of answering and the
+        transition never reaches the [CHANGE] marker.
+        """
+        mock_llm = MockLLM(
+            default_response=(
+                "[CHANGE] the hand was empty and now is holding the red block, "
+                "the red block was on the table and now is in the hand, "
+                "and the red block is no longer clear."
+            )
+        )
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+
+        world_model.step(state, BlockAction(ActionType.PICK_UP, "red"))
+
+        generate_calls = [call for call in mock_llm.calls if call.method == "generate"]
+        assert generate_calls
+        assert generate_calls[0].args["reasoning_effort"] == "low"
+
+    def test_world_model_extracts_the_change_section(self) -> None:
+        """A model that explains the prompt before answering still works."""
+        mock_llm = MockLLM(
+            default_response=(
+                "The user gave a scenario and asked for a change. "
+                "[CHANGE] the hand was empty and now is holding the red block, "
+                "the red block was on the table and now is in the hand, "
+                "and the red block is no longer clear."
+            )
+        )
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+        )
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+
+        next_state, _, _ = world_model.step(state, BlockAction(ActionType.PICK_UP, "red"))
+
+        assert next_state.holding == "red"
+
     def test_world_model_accepts_no_longer_covered_by_clause(self) -> None:
         """Models phrase "unstacked" as "no longer covered by", sometimes with the new state."""
         state = BlockState(

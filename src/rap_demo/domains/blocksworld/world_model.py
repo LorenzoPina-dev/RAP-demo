@@ -14,6 +14,10 @@ from rap_demo.domains.blocksworld.rewards import (
 )
 from rap_demo.llm.base import BaseLLM
 
+# The world-model update is a one-sentence task, so the reasoning models must not
+# spend the whole budget reasoning about the prompt instead of answering.
+_WORLD_MODEL_REASONING_EFFORT = "low"
+
 
 def _apply_text_change(state: BlockState, change_text: str) -> BlockState:
     """Applies a natural language state transition description to a BlockState."""
@@ -230,6 +234,18 @@ def _action_likelihood(action: BlockAction) -> float:
         return 1.0
 
 
+def _extract_change_section(text: str) -> str:
+    """Return the part of a world-model response that follows the [CHANGE] marker.
+
+    Models sometimes explain the prompt before answering. The marker section is
+    the only part that describes the transition.
+    """
+    marker = text.rfind("[CHANGE")
+    if marker < 0:
+        return text
+    return text[marker + len("[CHANGE") :].lstrip(": ]").strip()
+
+
 class BlocksworldWorldModel(WorldModel):
     """Simulates transitions and rewards in Blocksworld in hybrid or paper mode."""
 
@@ -244,6 +260,24 @@ class BlocksworldWorldModel(WorldModel):
         self.llm = llm
         self.mode = mode
         self.alpha = alpha
+
+    def _generate_change(self, prompt: str, temperature: float = 0.8) -> str:
+        """Ask the world model for the state change and return the [CHANGE] section.
+
+        The reasoning models spend the whole budget explaining the prompt
+        themselves when they reason at high effort, and the answer never reaches
+        the ``[CHANGE]`` marker. The update is a one-sentence task, so the
+        effort is capped and the marker section is extracted from whatever the
+        model wrapped around it.
+        """
+        change_text = self.llm.generate(
+            prompt,
+            max_tokens=2048,
+            temperature=temperature,
+            stop=["[STATE 1]"],
+            reasoning_effort=_WORLD_MODEL_REASONING_EFFORT,
+        )
+        return _extract_change_section(change_text)
 
     def step(
         self,
@@ -274,12 +308,7 @@ class BlocksworldWorldModel(WorldModel):
             if self.llm is None:
                 raise ValueError("LLM backend is required for paper mode world model simulation")
             prompt = build_world_update_prompt(state, action)
-            change_text = self.llm.generate(
-                prompt,
-                max_tokens=2048,
-                temperature=0.8,
-                stop=["[STATE 1]"],
-            )
+            change_text = self._generate_change(prompt)
             entry: dict[str, Any] | None = None
             if call_log is not None:
                 entry = {
@@ -297,9 +326,19 @@ class BlocksworldWorldModel(WorldModel):
             try:
                 next_state = _apply_text_change(state, change_text)
             except ValueError as exc:
+                # The sampled answer sometimes misses the [CHANGE] description.
+                # One greedy retry usually recovers it, and it keeps the
+                # self-evaluation of this action from being skipped.
+                retry_text = self._generate_change(prompt, temperature=0.0)
                 if entry is not None:
-                    entry["error"] = str(exc)
-                raise
+                    entry["response"] = retry_text
+                    entry["reason"] = "Retried with greedy decoding."
+                try:
+                    next_state = _apply_text_change(state, retry_text)
+                except ValueError as retry_exc:
+                    if entry is not None:
+                        entry["error"] = str(retry_exc)
+                    raise retry_exc from exc
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -318,9 +357,13 @@ class BlocksworldWorldModel(WorldModel):
                 p_yes, p_no, eval_response = self_evaluation_result(self.llm, eval_prompt)
                 # Paper (Section 3.2): R3 is the next-word probability of " Yes",
                 # not a renormalized Yes/No ratio.
-                if p_yes + p_no > 0.0:
+                answered = p_yes + p_no > 0.0
+                if answered:
                     eval_score = max(0.0, min(1.0, p_yes))
                 else:
+                    # The model never answered Yes/No, so there is no probability
+                    # to read. Fall back to a neutral score instead of using a
+                    # meaningless probability, and say so in the log.
                     eval_score = 0.5
                 if call_log is not None:
                     action_trace = getattr(action, "llm_trace", None)
@@ -330,8 +373,13 @@ class BlocksworldWorldModel(WorldModel):
                             "action": action.to_text(),
                             "prompt": eval_prompt,
                             "response": (
-                                f"Answer: {eval_response.strip() if eval_response else 'unavailable (no Yes/No token returned)'}\n"
+                                f"Answer: {eval_response.strip() if eval_response else 'unavailable (no response returned)'}\n"
                                 f"P(Yes)={p_yes:.6f}, P(No)={p_no:.6f}"
+                                + (
+                                    ""
+                                    if answered
+                                    else "\nNo Yes/No answer in the response: R3 falls back to the neutral 0.5."
+                                )
                             ),
                             "logprob": None,
                             "prob": None,

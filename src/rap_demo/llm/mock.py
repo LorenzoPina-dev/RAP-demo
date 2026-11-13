@@ -81,6 +81,7 @@ class MockLLM(BaseLLM):
         max_tokens: int = 128,
         temperature: float = 0.0,
         stop: list[str] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Generate deterministic text matching prompt rules.
 
@@ -89,6 +90,8 @@ class MockLLM(BaseLLM):
             max_tokens: Maximum tokens to generate (recorded in call trace).
             temperature: Sampling temperature (recorded in call trace).
             stop: Optional list of stop strings where generation halts.
+            reasoning_effort: Optional per-request reasoning effort (recorded
+                in the call trace, ignored otherwise).
 
         Returns:
             Matched text response truncated at earliest stop token.
@@ -104,6 +107,7 @@ class MockLLM(BaseLLM):
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "stop": stop,
+                    "reasoning_effort": reasoning_effort,
                 },
             )
         )

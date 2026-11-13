@@ -138,6 +138,7 @@ class LlamaServerClient(BaseLLM):
         max_tokens: int = 128,
         temperature: float = 0.0,
         stop: list[str] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Generate text completion from a prompt via /v1/completions.
 
@@ -146,6 +147,8 @@ class LlamaServerClient(BaseLLM):
             max_tokens: Maximum tokens to generate.
             temperature: Sampling temperature.
             stop: Optional list of stop sequences.
+            reasoning_effort: Optional per-request reasoning effort. The
+                llama-server endpoint has no such knob, so it is ignored.
 
         Returns:
             The generated text string.

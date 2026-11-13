@@ -851,6 +851,104 @@ class TestLiteLLMClientSelfEvaluationRetry:
         assert probabilities == {"Yes": 1.0, "No": 0.0}
         assert calls == [1, 512]
 
+    def test_yes_no_inside_a_truncated_rationale_is_not_the_answer(self) -> None:
+        """A Yes/No quoted in the middle of a reasoning trace is not the answer.
+
+        gpt-oss at high reasoning effort spends the whole budget thinking and the
+        transcript mentions "Yes" while analysing the plan. The distribution at
+        that position says nothing about the final choice, so it must be ignored.
+        """
+        thinking = (
+            " Thinking Process:\n"
+            " 1. Does picking up Red help build the stack? Yes, because Red must move.\n"
+            " 2. Are there other blocks involved? Orange is currently on Yellow."
+        )
+        entries = [
+            SimpleNamespace(
+                token=" Yes",
+                logprob=math.log(2e-06),
+                top_logprobs=[
+                    SimpleNamespace(token=" Yes", logprob=math.log(2e-06)),
+                    SimpleNamespace(token=" No", logprob=math.log(4e-06)),
+                ],
+            ),
+            SimpleNamespace(token=" because", logprob=math.log(0.4)),
+            SimpleNamespace(token=" Red", logprob=math.log(0.4)),
+            SimpleNamespace(token=" must", logprob=math.log(0.4)),
+            SimpleNamespace(token=" move", logprob=math.log(0.4)),
+            SimpleNamespace(token=".", logprob=math.log(0.4)),
+        ]
+        response = _make_obj_response(
+            thinking,
+            logprobs=SimpleNamespace(content=entries),
+        )
+        client = LiteLLMClient(completion_fn=lambda **_: response)
+
+        probabilities, content = client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert content == thinking
+        # The mid-rationale probability is not reported as the model's answer.
+        assert probabilities["Yes"] != pytest.approx(2e-06)
+        assert probabilities["Yes"] + probabilities["No"] in (pytest.approx(1.0), pytest.approx(0.0))
+
+    def test_missing_answer_reports_no_probability(self) -> None:
+        """Without any Yes/No answer the client reports the tokens as absent."""
+        calls: list[int] = []
+        responses = [
+            _make_obj_response("<|channel|>", logprobs=None),
+            _make_obj_response("Still thinking about the blocks", logprobs=None),
+        ]
+
+        def completion(**kwargs: Any) -> Any:
+            calls.append(int(kwargs["max_tokens"]))
+            return responses.pop(0)
+
+        client = LiteLLMClient(completion_fn=completion)
+        probabilities, content = client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert probabilities == {"Yes": 0.0, "No": 0.0}
+        assert content == "Still thinking about the blocks"
+        assert calls == [1, 512]
+
+    def test_ollama_self_evaluation_caps_the_reasoning_effort(self) -> None:
+        """A yes/no question must not be answered at "high" reasoning effort.
+
+        gpt-oss at high effort spends the whole token budget thinking and never
+        emits the answer, so the self-evaluation request downgrades the effort.
+        """
+        captured: dict[str, Any] = {}
+
+        def completion(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _make_obj_response("Yes", logprobs=None)
+
+        client = LiteLLMClient(
+            model="ollama/gpt-oss:20b",
+            api_base="http://localhost:11434",
+            completion_fn=completion,
+            reasoning_effort="high",
+        )
+        client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert captured["reasoning_effort"] == "low"
+
+    def test_self_evaluation_keeps_the_configured_effort_for_other_providers(self) -> None:
+        """Only the Ollama backend gets the capped effort."""
+        captured: dict[str, Any] = {}
+
+        def completion(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _make_obj_response("Yes", logprobs=None)
+
+        client = LiteLLMClient(
+            model="gpt-4o-mini",
+            completion_fn=completion,
+            reasoning_effort="high",
+        )
+        client.get_token_probabilities_and_response("q", ["Yes", "No"])
+
+        assert captured["reasoning_effort"] == "high"
+
 
 # ============================================================================
 # 5. Factory Integration (rap_demo.llm.factory.get_llm)

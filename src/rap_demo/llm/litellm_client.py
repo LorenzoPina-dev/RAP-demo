@@ -19,6 +19,12 @@ from rap_demo.llm.teacher_forcing import OllamaChatScorer
 # Reasoning models need room for their chain of thought before the final Yes/No.
 # gpt-oss needs ~128 tokens; qwen3.5 needs ~400 before it emits its answer.
 _SELF_EVAL_RETRY_MAX_TOKENS = 512
+# The self-evaluation is a yes/no question, so extended reasoning only wastes
+# the budget: gpt-oss at "high" effort spends the whole budget thinking and
+# never reaches the answer.
+_SELF_EVAL_REASONING_EFFORT = "low"
+# How many trailing tokens of a response may hold the final Yes/No answer.
+_ANSWER_TAIL_TOKENS = 3
 # Budget used when the model is asked to propose the next action so that the
 # logprob of the generated action tokens can be read back.
 _ACTION_SCORING_MAX_TOKENS = 512
@@ -258,12 +264,17 @@ def _extract_last_answer_candidates(
     answer. Looking at the first generated token (the old behaviour) therefore
     reads a channel marker such as ``<|channel|>`` instead of the answer. This
     walks every generated token and keeps the *last* one that matches a candidate.
+
+    Only the tail of the response is inspected: a Yes/No mentioned in the middle
+    of a truncated rationale is not the model's answer, and the distribution at
+    that position says nothing about the final choice.
     """
     wanted = {token.strip().casefold() for token in tokens if token.strip()}
     if not wanted:
         return {}
 
-    for entry in reversed(_extract_logprob_entries(logprobs)):
+    entries = _extract_logprob_entries(logprobs)
+    for entry in reversed(entries[-_ANSWER_TAIL_TOKENS:]):
         answer_token = _get_field(entry, "token")
         if answer_token is None or str(answer_token).strip().casefold() not in wanted:
             continue
@@ -414,6 +425,7 @@ class LiteLLMClient(BaseLLM):
         max_tokens: int,
         temperature: float,
         stop: list[str] | None = None,
+        reasoning_effort: str | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """Construct keyword arguments for litellm.completion, omitting None optionals."""
@@ -430,8 +442,9 @@ class LiteLLMClient(BaseLLM):
             kwargs["api_key"] = self.api_key
         if self.api_base is not None:
             kwargs["api_base"] = self.api_base
-        if self.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = self.reasoning_effort
+        effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
         kwargs.update(extra)
         return kwargs
 
@@ -509,6 +522,7 @@ class LiteLLMClient(BaseLLM):
         max_tokens: int,
         temperature: float,
         stop: list[str] | None,
+        reasoning_effort: str | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         """Open a streaming completion request, falling back if stream_options is unsupported."""
         kwargs = self._build_completion_kwargs(
@@ -516,6 +530,7 @@ class LiteLLMClient(BaseLLM):
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
+            reasoning_effort=reasoning_effort,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -532,6 +547,7 @@ class LiteLLMClient(BaseLLM):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop=stop,
+                reasoning_effort=reasoning_effort,
                 stream=True,
             )
             try:
@@ -547,6 +563,7 @@ class LiteLLMClient(BaseLLM):
         temperature: float,
         stop: list[str] | None,
         allow_retries: bool = True,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Execute non-streaming completion request and extract text content."""
         kwargs = self._build_completion_kwargs(
@@ -554,6 +571,7 @@ class LiteLLMClient(BaseLLM):
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
+            reasoning_effort=reasoning_effort,
         )
         try:
             response = self._invoke_completion(kwargs, allow_retries=allow_retries)
@@ -577,6 +595,7 @@ class LiteLLMClient(BaseLLM):
         max_tokens: int,
         temperature: float,
         stop: list[str] | None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Stream completion chunks, retrying transient errors with non-streaming fallback."""
         callback = self.on_token
@@ -587,6 +606,7 @@ class LiteLLMClient(BaseLLM):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop=stop,
+                reasoning_effort=reasoning_effort,
             )
             if not _is_chunk_stream(raw_stream):
                 choice = _extract_first_choice(raw_stream)
@@ -668,6 +688,7 @@ class LiteLLMClient(BaseLLM):
         max_tokens: int = 128,
         temperature: float = 0.0,
         stop: list[str] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Generate text completion from a prompt via LiteLLM.
 
@@ -676,6 +697,8 @@ class LiteLLMClient(BaseLLM):
             max_tokens: Maximum number of tokens to generate.
             temperature: Sampling temperature.
             stop: Optional list of stop sequences.
+            reasoning_effort: Optional per-request override of the client's
+                reasoning effort.
 
         Returns:
             The generated text string.
@@ -691,6 +714,7 @@ class LiteLLMClient(BaseLLM):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop=stop,
+                reasoning_effort=reasoning_effort,
             )
 
         return self._generate_non_streaming(
@@ -698,6 +722,7 @@ class LiteLLMClient(BaseLLM):
             max_tokens=max_tokens,
             temperature=temperature,
             stop=stop,
+            reasoning_effort=reasoning_effort,
         )
 
     def get_logprobs(self, prompt: str, target: str) -> float:
@@ -816,6 +841,10 @@ class LiteLLMClient(BaseLLM):
         one-token budget they only emit a channel marker such as ``<|channel|>``
         and never reach the Yes/No answer. When that happens the request is retried
         with a larger budget so the answer and its logprob can be read.
+
+        When no attempt produced a usable answer, the candidate tokens are
+        reported as absent (0.0) so the caller can fall back to a neutral reward
+        instead of using a meaningless probability.
         """
         probabilities, content = self._score_candidate_tokens(prompt, tokens, max_tokens=1)
 
@@ -829,9 +858,7 @@ class LiteLLMClient(BaseLLM):
         )
         if _token_probabilities_are_usable(retry_probabilities, retry_content):
             return retry_probabilities, retry_content
-        if (retry_content or "").strip() and not (content or "").strip():
-            return retry_probabilities, retry_content
-        return probabilities, content
+        return {token: 0.0 for token in tokens}, (retry_content or content)
 
     def _score_candidate_tokens(
         self,
@@ -852,6 +879,10 @@ class LiteLLMClient(BaseLLM):
         if ollama is not None:
             kwargs["model"], kwargs["api_base"] = ollama
             kwargs["api_key"] = self.api_key or _OLLAMA_API_KEY
+            if self.reasoning_effort is not None:
+                # A yes/no question does not need extended reasoning, and the
+                # reasoning models spend the whole budget on it otherwise.
+                kwargs["reasoning_effort"] = _SELF_EVAL_REASONING_EFFORT
         try:
             response = self._invoke_completion(kwargs)
         except Exception as exc:
@@ -878,7 +909,13 @@ class LiteLLMClient(BaseLLM):
         logprobs = _get_field(choice, "logprobs")
         candidates = _extract_last_answer_candidates(logprobs, tokens)
         if not candidates:
-            candidates = _extract_top_logprob_candidates(logprobs)
+            # The distribution of the very first token is the answer only when
+            # the model produced a single token. In a longer response the first
+            # token belongs to the beginning of the answer, not to the Yes/No
+            # choice, so its distribution must not be used.
+            entries = _extract_logprob_entries(logprobs)
+            if len(entries) <= 1:
+                candidates = _extract_top_logprob_candidates(logprobs)
         if candidates:
             matched = {
                 token: _match_token_logprob(candidates, token)

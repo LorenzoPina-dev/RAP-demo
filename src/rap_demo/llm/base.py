@@ -60,6 +60,7 @@ class BaseLLM(Protocol):
         max_tokens: int = 128,
         temperature: float = 0.0,
         stop: list[str] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Generate text completion from a prompt.
 
@@ -68,6 +69,9 @@ class BaseLLM(Protocol):
             max_tokens: Maximum number of tokens to generate.
             temperature: Sampling temperature (0.0 for greedy decoding).
             stop: Optional list of stop strings where generation halts.
+            reasoning_effort: Optional per-request override of the reasoning
+                effort ("low", "medium", "high"). Backends without support
+                ignore it.
 
         Returns:
             The generated text string.
