@@ -1146,6 +1146,31 @@ class TestProblemEditor:
         assert controller.goal == ["the red block is on top of the blue block"]
 
     @pytest.mark.asyncio
+    async def test_set_problem_warns_when_the_goal_does_not_fit_the_depth(
+        self, controller: SearchController
+    ) -> None:
+        """A goal that needs more actions than the depth limit is unreachable."""
+        state = BlockState(
+            clear={"red", "blue", "orange"},
+            on_table={"red", "blue", "yellow"},
+            on={"orange": "yellow"},
+            holding=None,
+        )
+        # Three stacked relations need six actions, the tree allows five.
+        result = await controller.set_problem(
+            state,
+            [
+                "the yellow block is on top of the blue block",
+                "the orange block is on top of the yellow block",
+                "the red block is on top of the orange block",
+            ],
+        )
+
+        assert "warning" in result
+        assert "shortest plan" in result["warning"]
+        assert "--max-depth" in result["warning"]
+
+    @pytest.mark.asyncio
     async def test_set_problem_propagates_goal_to_agent_and_world_model(self) -> None:
         """`set_problem` must update the Blocksworld agent prompt goal and reward goal."""
         from rap_demo.domains.blocksworld.agent import BlocksworldAgent

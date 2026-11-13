@@ -336,14 +336,24 @@ def build_hybrid_action_prompt(state: BlockState, goal: str | Sequence[str] | di
 
 def build_self_eval_prompt(
     state: BlockState,
-    action: BlockAction,
+    next_state: BlockState,
     goal: str | Sequence[str] | dict[str, str],
 ) -> str:
-    """Builds prompt querying LLM for self-evaluation of action quality towards goal."""
+    """Builds prompt querying LLM for self-evaluation of a state transition.
+
+    The question is about the *transition*, not about the action: the reference
+    implementation asks "is STATE 1 closer to the goal than STATE 0?". Asking
+    about the action instead makes the model answer "No" for the necessary
+    preparatory moves that do not satisfy a condition right away, which zeroes
+    the reward of the right first step.
+    """
     goal_str = format_goal(goal)
     return (
-        f"Current state: {state.to_text()}\n"
-        f"Goal: {goal_str}\n"
-        f"Proposed action: {action.to_text()}\n"
-        f"Is this action promising to achieve the goal? Answer Yes or No:"
+        "After being given an initial state, a new state, and a goal, determine if the new state "
+        'is closer to the goal. If the new state is closer, respond with "Yes". '
+        'Otherwise, respond with "No". Do not explain your reasoning.\n\n'
+        f"[STATE 0] I have that, {_strip_period(state.to_text())}.\n"
+        f"[STATE 1] I have that, {_strip_period(next_state.to_text())}.\n"
+        f"[GOAL] My goal is to have that {_strip_period(goal_str)}.\n"
+        '[QUESTION] Is "STATE 1" closer to the goal than "STATE 0"? Answer Yes or No:'
     )

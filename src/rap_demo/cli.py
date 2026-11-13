@@ -23,6 +23,7 @@ from rap_demo.core.events import EventBus
 from rap_demo.core.mcts import MCTS, extract_best_trajectory
 from rap_demo.core.node import MCTSNode
 from rap_demo.domains.blocksworld.domain import BlocksworldDomain
+from rap_demo.domains.blocksworld.planner import minimum_actions_to_goal
 from rap_demo.domains.blocksworld.problem import (
     DEFAULT_GOAL,
     DEFAULT_INITIAL_STATE,
@@ -352,6 +353,75 @@ def _add_problem_arguments(subparser: argparse.ArgumentParser) -> None:
             "Must be at least the minimum number of actions needed by the goal."
         ),
     )
+    subparser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        metavar="A",
+        help=(
+            "Weight of r1 (action likelihood) against r2 (goal heuristic) in the "
+            "weighted geometric mean (default: 0.5, the paper's value). "
+            "Lower values let the rule-based r2 steer the search more."
+        ),
+    )
+    subparser.add_argument(
+        "--self-eval-weight",
+        type=float,
+        default=0.25,
+        metavar="W",
+        help=(
+            "Weight of r3 (self-evaluation) in the weighted geometric mean "
+            "(default: 0.25; the paper does not specify a three-way weight)."
+        ),
+    )
+    subparser.add_argument(
+        "--r2-blocked-penalty",
+        type=float,
+        default=0.5,
+        metavar="P",
+        help=(
+            "Penalty for goal conditions that are blocked, i.e. that need extra "
+            "moves before they can be satisfied (default: 0.5). "
+            "Use 0 for the exact reward of the paper."
+        ),
+    )
+
+
+def _warn_unreachable_goal(
+    err_console: Any,
+    domain: BlocksworldDomain,
+    max_depth: int,
+) -> None:
+    """Warn when the depth limit is too small for the shortest plan.
+
+    The MCTS can only reach a goal within the depth limit L. When the task
+    needs more actions than that, no branch can earn the "super large reward"
+    and the search has no target to aim at.
+    """
+    try:
+        needed = minimum_actions_to_goal(domain.get_initial_state(), domain.goal)
+    except Exception:  # pragma: no cover - the check must never break the run
+        return
+    if needed is None:
+        err_console.print(
+            "[bold red]Warning:[/bold red] the goal cannot be reached from the initial state."
+        )
+        return
+    if needed > max_depth:
+        err_console.print(
+            f"[bold yellow]Warning:[/bold yellow] the shortest plan needs {needed} actions, "
+            f"but --max-depth is {max_depth}. The goal is unreachable in this tree: "
+            f"no branch can earn the final reward. Use --max-depth {needed}."
+        )
+
+
+def _reward_options(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect the reward-shaping flags shared by the run and ui commands."""
+    return {
+        "alpha": float(getattr(args, "alpha", 0.5)),
+        "self_eval_weight": float(getattr(args, "self_eval_weight", 0.25)),
+        "blocked_penalty": float(getattr(args, "r2_blocked_penalty", 0.5)),
+    }
 
 
 def _add_storage_arguments(subparser: argparse.ArgumentParser) -> None:
@@ -608,8 +678,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             llm=llm,
             mode=args.mode,
         )
+        _warn_unreachable_goal(err_console, domain, args.max_depth)
         mcts = MCTS(
-            world_model=domain.create_world_model(),
+            world_model=domain.create_world_model(**_reward_options(args)),
             reasoning_agent=domain.create_agent(),
             max_depth=args.max_depth,
             aggr_child="mean",
@@ -714,8 +785,9 @@ def cmd_ui(args: argparse.Namespace) -> int:
             llm=llm,
             mode=args.mode,
         )
+        _warn_unreachable_goal(err_console, domain, args.max_depth)
         mcts = MCTS(
-            world_model=domain.create_world_model(),
+            world_model=domain.create_world_model(**_reward_options(args)),
             reasoning_agent=domain.create_agent(),
             max_depth=args.max_depth,
             aggr_child="mean",

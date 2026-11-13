@@ -13,6 +13,7 @@ from typing import Any, Optional
 from rap_demo.core.events import Event, EventBus, EventType
 from rap_demo.core.mcts import MCTS, extract_best_trajectory
 from rap_demo.core.node import MCTSNode
+from rap_demo.domains.blocksworld.planner import minimum_actions_to_goal
 from rap_demo.domains.blocksworld.prompts import format_goal
 from rap_demo.visualizer.serializer import _serialize_state, serialize_tree
 
@@ -603,7 +604,35 @@ class SearchController:
         self.initial_state = initial_state
         self.goal = goal
         self._apply_goal_to_components(goal)
-        return await self.reset()
+        result = await self.reset()
+        warning = self._depth_warning()
+        if warning:
+            result["warning"] = warning
+        return result
+
+    def _depth_warning(self) -> str | None:
+        """Warn when the depth limit cannot reach the goal.
+
+        The MCTS can only reach a goal within the depth limit L, so a goal that
+        needs more actions than that never earns the "super large reward" and
+        the search has no target to aim at.
+        """
+        max_depth = getattr(self.mcts, "max_depth", None)
+        if max_depth is None:
+            return None
+        try:
+            needed = minimum_actions_to_goal(self.initial_state, self.goal)
+        except Exception:  # pragma: no cover - the check must never break the UI
+            return None
+        if needed is None:
+            return "The goal cannot be reached from this initial state."
+        if needed > max_depth:
+            return (
+                f"The shortest plan needs {needed} actions, but the depth limit is {max_depth}. "
+                f"The goal is unreachable in this tree: no branch can earn the final reward. "
+                f"Restart with --max-depth {needed}."
+            )
+        return None
 
     def _apply_goal_to_components(self, goal: Any) -> None:
         """Propagates a new goal to the MCTS reasoning agent and world model, when supported."""

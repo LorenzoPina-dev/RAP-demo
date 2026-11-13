@@ -54,6 +54,7 @@ from rap_demo.domains.blocksworld.rewards import (
 )
 from rap_demo.domains.blocksworld.agent import BlocksworldAgent
 from rap_demo.domains.blocksworld.prompts import build_hybrid_action_prompt
+from rap_demo.domains.blocksworld.planner import minimum_actions_to_goal
 from rap_demo.domains.blocksworld.world_model import BlocksworldWorldModel
 from rap_demo.domains.blocksworld.domain import BlocksworldDomain
 from rap_demo.llm.mock import MockLLM
@@ -704,6 +705,55 @@ class TestBlocksworldRewards:
         )
         assert r_balanced > 0.0
 
+    def test_calculate_combined_reward_floors_a_zero_self_evaluation(self) -> None:
+        """A "No" from the model must not zero the whole reward.
+
+        The reward is a weighted geometric mean, so a single zero factor would
+        annihilate the product and hide the branch completely.
+        """
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        action = BlockAction(ActionType.PICK_UP, "red")
+        goal = ["the red block is on top of the blue block"]
+
+        zero_eval = calculate_combined_reward(
+            state, action, goal, action_score=0.9, alpha=0.5, eval_score=0.0
+        )
+        one_eval = calculate_combined_reward(
+            state, action, goal, action_score=0.9, alpha=0.5, eval_score=1.0
+        )
+
+        assert zero_eval > 0.0
+        assert zero_eval < one_eval
+
+    def test_calculate_goal_reward_penalises_blocked_conditions(self) -> None:
+        """A condition whose blocks are not free needs extra moves, so it is penalised."""
+        goal = [
+            "the red block is on top of the blue block",
+            "the orange block is on top of the red block",
+            "the green block is on top of the orange block",
+        ]
+        # The detour: the orange is already on the red, so the red is no longer
+        # clear and "the red block is on top of the blue block" needs extra moves.
+        detour = BlockState(
+            clear={"green", "yellow"},
+            on_table={"blue", "red", "yellow"},
+            on={"orange": "red"},
+        )
+        # The correct branch: the red is on the blue and everything else is free.
+        correct = BlockState(
+            clear={"red", "green", "orange", "yellow"},
+            on_table={"blue", "green", "yellow"},
+            on={"red": "blue", "orange": "yellow"},
+        )
+
+        detour_reward = calculate_goal_reward(detour, goal)
+        correct_reward = calculate_goal_reward(correct, goal)
+
+        assert detour_reward < correct_reward
+        assert calculate_goal_reward(detour, goal, blocked_penalty=0.0) == pytest.approx(
+            calculate_goal_reward(correct, goal, blocked_penalty=0.0)
+        )
+
     def test_calculate_combined_reward_uses_weighted_geometric_mean(self) -> None:
         """The reference implementation combines rewards with a geometric mean."""
         state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
@@ -770,7 +820,9 @@ class TestBlocksworldRewards:
             on={"green": "orange", "orange": "blue"},
         )
 
-        assert calculate_goal_reward(partial_state, goal) == 1.0
+        assert calculate_goal_reward(partial_state, goal) == 0.75
+        # Without the blocked-condition penalty the reward is the paper's one.
+        assert calculate_goal_reward(partial_state, goal, blocked_penalty=0.0) == 1.0
         assert calculate_goal_reward(complete_state, goal) == 100.0
 
     def test_build_self_eval_prompt(self, instance_5_state: BlockState) -> None:
@@ -1007,6 +1059,47 @@ class TestBlocksworldAgent:
 
         assert all(action.llm_trace["r1_source"] == "uniform-fallback" for action in actions)
         assert math.isclose(sum(action.llm_trace["prob"] for action in actions), 1.0)
+
+
+class TestBlocksworldPlanner:
+    """Tests for the shortest-plan lookup used by the depth pre-flight check."""
+
+    def test_minimum_actions_to_goal_finds_the_shortest_plan(self) -> None:
+        """The chain goal needs eight actions from the demo state."""
+        state = BlockState.from_text(
+            "the blue block is clear, the green block is clear, the orange block is clear, "
+            "the red block is clear, the hand is empty, the orange block is on top of the yellow block, "
+            "the blue block is on the table, the green block is on the table, the red block is on the "
+            "table and the yellow block is on the table"
+        )
+        goal = [
+            "the yellow block is on top of the blue block",
+            "the orange block is on top of the yellow block",
+            "the green block is on top of the orange block",
+        ]
+
+        assert minimum_actions_to_goal(state, goal) == 8
+
+    def test_minimum_actions_to_goal_returns_zero_when_already_solved(self) -> None:
+        state = BlockState(
+            clear={"green"},
+            on_table={"blue"},
+            on={"yellow": "blue", "orange": "yellow", "green": "orange"},
+        )
+        goal = [
+            "the yellow block is on top of the blue block",
+            "the orange block is on top of the yellow block",
+            "the green block is on top of the orange block",
+        ]
+
+        assert minimum_actions_to_goal(state, goal) == 0
+
+    def test_minimum_actions_to_goal_returns_none_for_an_unreachable_goal(self) -> None:
+        """A goal about a block that is not in the state cannot be reached."""
+        state = BlockState(clear={"red"}, on_table={"red"})
+        goal = ["the green block is on top of the red block"]
+
+        assert minimum_actions_to_goal(state, goal) is None
 
 
 # ============================================================================
@@ -1250,6 +1343,30 @@ class TestBlocksworldWorldModel:
 
         assert next_state.holding == "red"
         assert temperatures == [0.8, 0.0]
+
+    def test_world_model_skips_the_self_evaluation_when_its_weight_is_zero(self) -> None:
+        """With no weight on r3 the expensive self-evaluation call is skipped."""
+        mock_llm = MockLLM(
+            default_response=(
+                "[CHANGE] the hand was empty and now is holding the red block, "
+                "the red block was on the table and now is in the hand, "
+                "and the red block is no longer clear."
+            )
+        )
+        world_model = BlocksworldWorldModel(
+            goal=["the red block is on top of the blue block"],
+            llm=mock_llm,
+            mode="paper",
+            self_eval_weight=0.0,
+        )
+        state = BlockState(clear={"red", "blue"}, on_table={"red", "blue"})
+        log: list[dict[str, Any]] = []
+
+        _, reward, _ = world_model.step(state, BlockAction(ActionType.PICK_UP, "red"), call_log=log)
+
+        assert not [call for call in log if call.get("phase") == "self-evaluation"]
+        assert not [call for call in mock_llm.calls if call.method != "generate"]
+        assert reward > 0.0
 
     def test_world_model_caps_the_reasoning_effort(self) -> None:
         """The state update is a one-sentence task, so the effort stays low.

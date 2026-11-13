@@ -468,7 +468,11 @@ class VisualizerApp {
         this.renderTabletop();
         this.renderStateOverview(data.state, data.state);
       }
-      this.showToast("Problem updated. Press Play to start the new search.");
+      if (data.warning) {
+        this.showToast(data.warning);
+      } else {
+        this.showToast("Problem updated. Press Play to start the new search.");
+      }
     } catch (err) {
       console.error("Failed to apply problem:", err);
       this.showProblemError(`Problem rejected: ${err.message}`);

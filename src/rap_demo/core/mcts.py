@@ -3,6 +3,7 @@
 from __future__ import annotations
 import inspect
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Protocol, runtime_checkable
 from rap_demo.core.node import MCTSNode
 from rap_demo.core.events import EventBus, EventType
@@ -27,6 +28,17 @@ class ReasoningAgent(Protocol):
 
 
 _UNVISITED_BASE = 1e6
+
+
+def _state_key(state: Any) -> str:
+    """Return a canonical key of a state, used to detect repeated states."""
+    to_text = getattr(state, "to_text", None)
+    if callable(to_text):
+        try:
+            return str(to_text())
+        except Exception:  # pragma: no cover - defensive, the state is opaque
+            pass
+    return repr(state)
 
 
 def _action_prior(action: Any) -> float:
@@ -238,6 +250,7 @@ class MCTS:
         world_model: Optional[WorldModel] = None,
         reasoning_agent: Optional[ReasoningAgent] = None,
         event_bus: Optional[EventBus] = None,
+        max_parallel_actions: int = 4,
     ) -> None:
         self.w_exp = w_exp
         self.discount = discount
@@ -247,6 +260,7 @@ class MCTS:
         self.world_model = world_model
         self.reasoning_agent = reasoning_agent
         self.event_bus = event_bus
+        self.max_parallel_actions = max(1, max_parallel_actions)
 
     def search(self, root_state: Any, num_iterations: int) -> MCTSNode:
         """Runs MCTS search from the given root state for num_iterations cycles."""
@@ -324,6 +338,50 @@ class MCTS:
         exploration = self.w_exp * math.sqrt(math.log(max(parent.N, 1)) / child.N)
         return exploitation + exploration
 
+    def _simulate_actions(
+        self,
+        node: MCTSNode,
+        actions: list[Any],
+    ) -> list[tuple[Any, tuple[Any, float, bool, dict[str, Any], list[dict[str, Any]]] | None]]:
+        """Simulate every candidate action of a node, concurrently when possible.
+
+        The world model and the self-evaluation dominate the cost of an
+        expansion and are independent per action, so the candidates are
+        simulated in parallel. The results keep the order of the actions, and
+        an unusable transition is reported as ``None`` so the caller can drop
+        that action.
+        """
+
+        def run(action: Any) -> tuple[Any, Any]:
+            call_log: list[dict[str, Any]] = []
+            reward_components: dict[str, Any] = {}
+            try:
+                next_state, step_reward, is_terminal = _safe_step(
+                    self.world_model,
+                    node.state,
+                    action,
+                    lightweight=False,
+                    call_log=call_log,
+                    reward_sink=reward_components,
+                )
+            except (ValueError, KeyError, AssertionError):
+                return action, None
+            return action, (
+                next_state,
+                step_reward,
+                is_terminal,
+                reward_components,
+                call_log,
+            )
+
+        if len(actions) <= 1:
+            return [run(action) for action in actions]
+
+        with ThreadPoolExecutor(
+            max_workers=min(len(actions), self.max_parallel_actions)
+        ) as pool:
+            return list(pool.map(run, actions))
+
     def expand(self, node: MCTSNode) -> list[MCTSNode]:
         """Expands the selected leaf node using ReasoningAgent and WorldModel."""
         if node.is_terminal or node.depth >= self.max_depth:
@@ -351,21 +409,13 @@ class MCTS:
             if entry is not None:
                 node.llm_calls.append(entry)
 
-        for action in actions:
-            reward_components: dict[str, Any] = {}
-            try:
-                next_state, step_reward, is_terminal = _safe_step(
-                    self.world_model,
-                    node.state,
-                    action,
-                    lightweight=False,
-                    call_log=node.llm_calls,
-                    reward_sink=reward_components,
-                )
-            except (ValueError, KeyError, AssertionError):
-                # A hallucinated world-model transition must not kill the search:
-                # the action is simply not added to the tree.
+        for action, outcome in self._simulate_actions(node, actions):
+            if outcome is None:
+                # A hallucinated world-model transition must not kill the
+                # search: the action is simply not added to the tree.
                 continue
+            next_state, step_reward, is_terminal, reward_components, action_log = outcome
+            node.llm_calls.extend(action_log)
             # The paper terminates a node when the goal is met or the depth limit is hit.
             depth_terminal = node.depth + 1 >= self.max_depth
             child = MCTSNode(
@@ -399,6 +449,10 @@ class MCTS:
         sim_path: list[MCTSNode] = [curr]
         rollout_reward = base_reward
         discount_power = 1.0
+        # A move that undoes the previous one (for instance stacking a block
+        # back where it came from) would let the rollout loop forever and
+        # inflate the value of the branch. The loop is cut instead.
+        visited: set[str] = {_state_key(curr.state)}
 
         while not curr.is_terminal and curr.depth < self.max_depth:
             if self.reasoning_agent is None or self.world_model is None:
@@ -436,6 +490,10 @@ class MCTS:
             if best_action is None:
                 break
 
+            if _state_key(best_next_state) in visited:
+                # The rollout would repeat a state: stop here.
+                break
+
             next_node = MCTSNode(
                 state=best_next_state,
                 action=best_action,
@@ -451,6 +509,7 @@ class MCTS:
             rollout_reward += discount_power * best_reward
             discount_power *= self.discount
             curr = next_node
+            visited.add(_state_key(best_next_state))
             if self.event_bus:
                 self.event_bus.emit(
                     EventType.ON_SIMULATE_STEP,

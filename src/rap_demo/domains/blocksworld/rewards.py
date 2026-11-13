@@ -61,7 +61,34 @@ def _split_goal_text(text: str) -> list[str]:
     return conditions
 
 
-def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, str] | str) -> float:
+def _condition_is_blocked(state: BlockState, condition: str) -> bool:
+    """Whether a goal condition needs extra moves before it can be satisfied.
+
+    To satisfy "the X block is on top of the Y block", X has to be held and Y
+    has to be clear. When either of them is not available the condition is not
+    simply unmet, it needs extra actions first, so the state is already moving
+    away from the goal. Detecting that keeps the search out of the branches
+    that block a block another condition needs.
+    """
+    match = re.search(
+        r"the\s+(\w+)\s+block\s+is\s+on\s+top\s+of\s+the\s+(\w+)\s+block",
+        condition,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    top, bottom = match.group(1).lower(), match.group(2).lower()
+    for block in (top, bottom):
+        if block not in state.clear and state.holding != block:
+            return True
+    return False
+
+
+def calculate_goal_reward(
+    state: BlockState,
+    goals: Sequence[str] | dict[str, str] | str,
+    blocked_penalty: float = 0.5,
+) -> float:
     """Calculates the task-specific goal heuristic R2 (RAP Section 4.1).
 
     R2 compares the predicted next state with the goal conditions and scales with
@@ -72,6 +99,10 @@ def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, st
     ``sum(meetings) / len(meetings) + 0.5`` for partial progress and ``100`` for
     a complete goal. The ``+ 0.5`` offset keeps R2 strictly positive, which the
     weighted geometric mean combination requires.
+
+    ``blocked_penalty`` is an extension: a condition that is not merely unmet
+    but blocked (it needs extra moves before it can be satisfied) is penalized.
+    With ``blocked_penalty = 0`` the reward is exactly the paper's one.
     """
     conditions: list[str] = []
 
@@ -93,7 +124,28 @@ def calculate_goal_reward(state: BlockState, goals: Sequence[str] | dict[str, st
 
     if satisfied == total:
         return 100.0
-    return float(satisfied) / float(total) + 0.5
+
+    reward = float(satisfied) / float(total) + 0.5
+
+    if blocked_penalty > 0.0:
+        # A condition that is not merely unmet but blocked needs extra moves
+        # before it can be satisfied. This is an extension of the paper's R2:
+        # with blocked_penalty = 0 the reward is exactly the paper's one.
+        blocked = sum(
+            1
+            for c in conditions
+            if not _is_condition_satisfied(state, c) and _condition_is_blocked(state, c)
+        )
+        reward -= blocked_penalty * float(blocked) / float(total)
+
+    return max(0.0, reward)
+
+
+# A self-evaluation of "No" must not zero the whole reward: in a weighted
+# geometric mean a single zero factor annihilates the product. The reference
+# implementation keeps its goal reward strictly positive for the very same
+# reason (the "+ 0.5" offset of ``r1_fn``).
+_SELF_EVAL_FLOOR = 0.05
 
 
 def calculate_combined_reward(
@@ -104,6 +156,7 @@ def calculate_combined_reward(
     alpha: float = 0.5,
     eval_score: float | None = None,
     self_eval_weight: float = 0.25,
+    blocked_penalty: float = 0.5,
 ) -> float:
     """Combine R1/R2 and, when available, R3 into the transition reward.
 
@@ -117,14 +170,19 @@ def calculate_combined_reward(
     Table 5. The paper reports that adding it helps (0.88 -> 0.91) but does
     not give a three-way formula, so its raw weight is ``self_eval_weight``
     and all weights are normalized to sum to one.
+
+    ``eval_score`` is floored at ``_SELF_EVAL_FLOOR``: a model that answers
+    "No" would otherwise zero the whole reward and hide the branch.
     """
-    goal_score = calculate_goal_reward(state, goals)
+    goal_score = calculate_goal_reward(state, goals, blocked_penalty=blocked_penalty)
     components: list[tuple[float, float]] = [
         (float(action_score), float(alpha)),
         (float(goal_score), float(1.0 - alpha)),
     ]
     if eval_score is not None and self_eval_weight > 0.0:
-        components.append((float(eval_score), float(self_eval_weight)))
+        components.append(
+            (max(float(eval_score), _SELF_EVAL_FLOOR), float(self_eval_weight))
+        )
 
     total_weight = sum(weight for _, weight in components)
     reward = 1.0
@@ -198,7 +256,7 @@ class BlocksworldRewardFunction:
     ) -> float:
         eval_score: float | None = None
         if self.use_self_eval and self.llm is not None:
-            prompt = build_self_eval_prompt(state, action, self.goal)
+            prompt = build_self_eval_prompt(state, state.apply_action(action), self.goal)
             eval_score = score_self_evaluation(self.llm, prompt)
 
         return calculate_combined_reward(

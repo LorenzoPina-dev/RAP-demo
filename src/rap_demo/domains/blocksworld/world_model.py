@@ -255,11 +255,15 @@ class BlocksworldWorldModel(WorldModel):
         llm: Optional[BaseLLM] = None,
         mode: str = "hybrid",
         alpha: float = 0.5,
+        self_eval_weight: float = 0.25,
+        blocked_penalty: float = 0.5,
     ) -> None:
         self.goal = goal
         self.llm = llm
         self.mode = mode
         self.alpha = alpha
+        self.self_eval_weight = self_eval_weight
+        self.blocked_penalty = blocked_penalty
 
     def _generate_change(self, prompt: str, temperature: float = 0.8) -> str:
         """Ask the world model for the state change and return the [CHANGE] section.
@@ -342,7 +346,7 @@ class BlocksworldWorldModel(WorldModel):
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-        goal_reward = calculate_goal_reward(next_state, self.goal)
+        goal_reward = calculate_goal_reward(next_state, self.goal, blocked_penalty=self.blocked_penalty)
         is_terminal = goal_reward >= 100.0
         action_score = _action_likelihood(action)
         eval_score: float | None = None
@@ -352,8 +356,12 @@ class BlocksworldWorldModel(WorldModel):
             step_reward = goal_reward
         else:
             eval_score = 0.5 if not lightweight else None
-            if not lightweight and self.llm is not None:
-                eval_prompt = build_self_eval_prompt(state, action, self.goal)
+            if (
+                not lightweight
+                and self.llm is not None
+                and self.self_eval_weight > 0.0
+            ):
+                eval_prompt = build_self_eval_prompt(state, next_state, self.goal)
                 p_yes, p_no, eval_response = self_evaluation_result(self.llm, eval_prompt)
                 # Paper (Section 3.2): R3 is the next-word probability of " Yes",
                 # not a renormalized Yes/No ratio.
@@ -403,6 +411,8 @@ class BlocksworldWorldModel(WorldModel):
                 action_score=action_score,
                 alpha=self.alpha,
                 eval_score=eval_score,
+                self_eval_weight=self.self_eval_weight,
+                blocked_penalty=self.blocked_penalty,
             )
 
         if reward_sink is not None:

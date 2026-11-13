@@ -481,6 +481,27 @@ class TestMCTSSimulation:
         assert sim_path[-1].depth <= 3
 
 
+    def test_simulate_stops_when_the_rollout_repeats_a_state(self) -> None:
+        """A move that undoes the previous one must not loop the rollout."""
+
+        class _LoopingWorld:
+            """Every action returns to the previous state."""
+
+            def get_actions(self, state, remaining_steps=None):
+                return ["back"]
+
+            def step(self, state, action):
+                return state, 1.0, False
+
+        mcts = MCTS(world_model=_LoopingWorld(), reasoning_agent=_LoopingWorld(), max_depth=8)
+
+        node = MCTSNode(state="S0", depth=0)
+        sim_path, _ = mcts.simulate(node)
+
+        # The first step repeats the initial state, so the rollout stops there.
+        assert len(sim_path) == 1
+
+
 class TestMCTSBackpropagation:
     """Verifies backpropagation updates N(s), Q(s,a), and M(s,a) according to RAP Eq. 2."""
 
